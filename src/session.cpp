@@ -232,7 +232,8 @@ void BlizSessionImpl::init_session() {
        (Give-to-Get principle from Tribler research). */
     sp.set_int(lt::settings_pack::unchoke_slots_limit,   8);
 
-    /* Disk read cache: 512 MB of read-ahead kept in RAM (libtorrent 2.x API) */
+    /* Disk read cache: 512 MB of read-ahead kept in RAM */
+    sp.set_int(lt::settings_pack::cache_size,            2048); /* 2048 × 256 KB */
     sp.set_int(lt::settings_pack::read_cache_line_size,  32);
 
     /* DHT + LSD for peer discovery */
@@ -283,7 +284,7 @@ void BlizSessionImpl::alert_loop() {
 }
 
 void BlizSessionImpl::on_read_piece(lt::read_piece_alert* rpa) {
-    if (rpa->error) return;
+    if (rpa->ec) return;
 
     std::vector<char> data(rpa->buffer.get(),
                            rpa->buffer.get() + rpa->size);
