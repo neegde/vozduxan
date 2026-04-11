@@ -33,7 +33,7 @@ constexpr int HIGH_PRIORITY_PIECES  = 20;    /* pieces with hard deadline  */
 constexpr int MID_PRIORITY_PIECES   = 60;    /* high-priority lookahead    */
 constexpr int PRIORITY_TICK_MS      = 100;   /* priority worker interval   */
 constexpr int PIECE_TIMEOUT_MS      = 20'000;/* max wait for one piece     */
-constexpr int METADATA_TIMEOUT_S    = 30;    /* magnet metadata resolution */
+constexpr int METADATA_TIMEOUT_S    = 90;    /* magnet metadata resolution (slow DHT / trackers) */
 constexpr int HTTP_RECV_TIMEOUT_MS  = 5'000; /* idle HTTP socket           */
 constexpr int FAST_START_TIMEOUT_MS = 8'000; /* max wait for first piece   */
 
@@ -133,6 +133,9 @@ private:
     std::string    generate_token();
     static std::string detect_mime(const std::string& filename);
 
+    /* structured logging: log_fn_ when set; else stderr */
+    void log(const char* fmt, ...);
+
     /* ── members ─────────────────────────────────────────────────────── */
     /* storage_path_ owns the path string so cfg_.storage_path doesn't
        dangle after the caller's CString is dropped on the Rust side. */
@@ -155,6 +158,9 @@ private:
     std::vector<IdleTorrent> idle_torrents_;
 
     std::atomic<uint32_t> token_counter_{0};
+
+    BlizLogFn   log_fn_{nullptr};
+    void*       log_userdata_{nullptr};
 };
 
 } // namespace bliz

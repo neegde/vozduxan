@@ -13,8 +13,8 @@
  *   - Fast-start: primes first HIGH_PRIORITY_PIECES pieces immediately after
  *     metadata resolve, then waits up to FAST_START_TIMEOUT_MS for piece 0
  *     so the HTTP client never blocks on first read.
- *   - Seek cancellation: seek_generation counter lets serve_range() abort
- *     instantly when a new Range request arrives for the same stream.
+ *   - seek_generation aborts serve_range only when the stream is released;
+ *     parallel Range requests (browser sniff + read) must not cancel each other.
  *   - Condition variable for metadata signalling (no polling delay).
  *   - Cross-platform: all sockets abstracted through compat.hpp.
  */
@@ -30,6 +30,7 @@
 #include <libtorrent/extensions/smart_ban.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -41,8 +42,31 @@
 namespace bliz {
 namespace fs = std::filesystem;
 
-/* ── Lightweight logger ───────────────────────────────────────────────── */
-static void bliz_log(const char* fmt, ...) {
+namespace {
+
+/** Lowercase 40-char hex btih in `urn:btih:` for consistent peer/torrent id matching. */
+std::string normalize_magnet_btih_hex(std::string m) {
+    const char* key = "urn:btih:";
+    size_t      pos = 0;
+    while ((pos = m.find(key, pos)) != std::string::npos) {
+        size_t h = pos + std::strlen(key);
+        size_t e = h;
+        while (e < m.size() && std::isxdigit(static_cast<unsigned char>(m[e]))) ++e;
+        if (e - h == 40) {
+            for (size_t i = h; i < e; ++i) {
+                m[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(m[i])));
+            }
+        }
+        pos = e;
+    }
+    return m;
+}
+
+}  // namespace
+
+/* ── Structured logger — member function ────────────────────────────────
+   If log_fn_ is set, only the callback runs (in-app console). Otherwise stderr. */
+void BlizSessionImpl::log(const char* fmt, ...) {
     using clock = std::chrono::system_clock;
     auto now    = clock::now();
     auto ms     = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -56,15 +80,23 @@ static void bliz_log(const char* fmt, ...) {
 #endif
     char timebuf[32];
     std::strftime(timebuf, sizeof(timebuf), "%H:%M:%S", &tm_buf);
-    fprintf(stderr, "[bliz %s.%03lld] ", timebuf, (long long)ms);
+
+    char body[1024];
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
-    fflush(stderr);
+
+    if (log_fn_) {
+        char full[1088];
+        snprintf(full, sizeof(full), "[bliz %s.%03lld] %s", timebuf, (long long)ms, body);
+        log_fn_(full, log_userdata_);
+    } else {
+        fprintf(stderr, "[bliz %s.%03lld] %s\n", timebuf, (long long)ms, body);
+        fflush(stderr);
+    }
 }
-#define BLIZ_LOG(...) bliz_log(__VA_ARGS__)
+#define BLIZ_LOG(...) this->log(__VA_ARGS__)
 
 /* ════════════════════════════════════════════════════════════════════════
  *  Helpers
@@ -200,6 +232,10 @@ BlizSessionImpl::BlizSessionImpl(const BlizConfig& cfg)
 {
     cfg_.storage_path = nullptr; /* intentionally nulled — use storage_path_ */
 
+    // Store log callback before the first BLIZ_LOG call below.
+    log_fn_       = cfg.log_fn;
+    log_userdata_ = cfg.log_userdata;
+
     winsock_init();
 
     if (cfg_.cache_max_bytes == 0) cfg_.cache_max_bytes = 50ULL * 1024 * 1024 * 1024;
@@ -262,8 +298,12 @@ void BlizSessionImpl::init_session() {
 
     /* Aggressive peer connections for faster swarm discovery */
     sp.set_int(lt::settings_pack::connection_speed,      500);
-    sp.set_int(lt::settings_pack::peer_connect_timeout,    4);
+    /* Default libtorrent is ~15s; values like 4s abort many handshakes before ut_metadata. */
+    sp.set_int(lt::settings_pack::peer_connect_timeout,   15);
     sp.set_int(lt::settings_pack::num_want,              200);
+
+    sp.set_bool(lt::settings_pack::announce_to_all_tiers,    true);
+    sp.set_bool(lt::settings_pack::announce_to_all_trackers, true);
 
     /* Upload slots — Give-to-Get: maintain unchoke reciprocity */
     sp.set_int(lt::settings_pack::unchoke_slots_limit, 8);
@@ -465,11 +505,10 @@ void BlizSessionImpl::handle_http_connection(sock_t sock) {
             break;
         }
 
-        /* ── Seek: bump generation to cancel any in-flight serve_range ── */
+        /* Snapshot generation for this response. Do NOT bump on Range: media
+         * players often open parallel byte-range requests (e.g. start + tail for
+         * tags); bumping would cancel sibling transfers and truncate the body. */
         uint64_t gen = st->seek_generation.load(std::memory_order_acquire);
-        if (req.has_range) {
-            gen = st->seek_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-        }
 
         int64_t file_size = st->file_size;
         int64_t rstart    = req.has_range ? req.range_start : 0;
@@ -705,8 +744,9 @@ lt::add_torrent_params BlizSessionImpl::make_atp(const char*    magnet,
         if (ec) throw std::runtime_error(ec.message());
         atp.ti = ti;
     } else if (magnet && *magnet) {
+        std::string    mnorm = normalize_magnet_btih_hex(std::string(magnet));
         lt::error_code ec;
-        atp = lt::parse_magnet_uri(magnet, ec);
+        atp = lt::parse_magnet_uri(mnorm.c_str(), ec);
         if (ec) throw std::runtime_error(ec.message());
     } else {
         throw std::runtime_error("no magnet or torrent data");

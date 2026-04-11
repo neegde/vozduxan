@@ -24,12 +24,19 @@ extern "C" {
 /* ── Opaque handle ─────────────────────────────────────────────────────── */
 typedef struct BlizSession BlizSession;
 
+/* ── Log callback ──────────────────────────────────────────────────────── */
+/** Called from any thread; message is a null-terminated UTF-8 string.
+ *  NULL disables the callback (logs go to stderr only).                */
+typedef void (*BlizLogFn)(const char* message, void* userdata);
+
 /* ── Configuration ─────────────────────────────────────────────────────── */
 typedef struct {
     const char* storage_path;    /* directory for torrent data              */
     uint64_t    cache_max_bytes; /* max disk usage; 0 = 50 GB              */
     uint32_t    cache_ttl_secs;  /* idle-torrent TTL; 0 = 3 600 s          */
     int         listen_port;     /* BT listen port; 0 = random             */
+    BlizLogFn   log_fn;          /* optional log callback; NULL = off      */
+    void*       log_userdata;    /* passed verbatim to log_fn              */
 } BlizConfig;
 
 /* ── Error codes ───────────────────────────────────────────────────────── */
