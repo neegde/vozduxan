@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -39,6 +40,31 @@
 
 namespace bliz {
 namespace fs = std::filesystem;
+
+/* ── Lightweight logger ───────────────────────────────────────────────── */
+static void bliz_log(const char* fmt, ...) {
+    using clock = std::chrono::system_clock;
+    auto now    = clock::now();
+    auto ms     = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      now.time_since_epoch()).count() % 1000;
+    auto t      = clock::to_time_t(now);
+    struct tm tm_buf;
+#ifdef _WIN32
+    localtime_s(&tm_buf, &t);
+#else
+    localtime_r(&t, &tm_buf);
+#endif
+    char timebuf[32];
+    std::strftime(timebuf, sizeof(timebuf), "%H:%M:%S", &tm_buf);
+    fprintf(stderr, "[bliz %s.%03lld] ", timebuf, (long long)ms);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+#define BLIZ_LOG(...) bliz_log(__VA_ARGS__)
 
 /* ════════════════════════════════════════════════════════════════════════
  *  Helpers
@@ -188,6 +214,9 @@ BlizSessionImpl::BlizSessionImpl(const BlizConfig& cfg)
 
     /* give server a moment to bind */
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    BLIZ_LOG("session created — storage=%s http_port=%d",
+             storage_path_.c_str(), (int)http_port_);
 }
 
 BlizSessionImpl::~BlizSessionImpl() {
@@ -288,7 +317,11 @@ void BlizSessionImpl::alert_loop() {
 }
 
 void BlizSessionImpl::on_read_piece(lt::read_piece_alert* rpa) {
-    if (rpa->error) return;
+    if (rpa->error) {
+        BLIZ_LOG("read_piece ERROR piece=%d: %s",
+                 (int)rpa->piece, rpa->error.message().c_str());
+        return;
+    }
 
     std::vector<char> data(rpa->buffer.get(),
                            rpa->buffer.get() + rpa->size);
@@ -312,7 +345,9 @@ void BlizSessionImpl::on_read_piece(lt::read_piece_alert* rpa) {
 }
 
 void BlizSessionImpl::on_metadata_received(lt::metadata_received_alert* a) {
+    BLIZ_LOG("metadata_received alert — scanning streams for match");
     std::lock_guard<std::mutex> lock(streams_mutex_);
+    int matched = 0;
     for (auto& [token, st] : streams_) {
         if (st->handle == a->handle) {
             {
@@ -320,11 +355,17 @@ void BlizSessionImpl::on_metadata_received(lt::metadata_received_alert* a) {
                 st->metadata_ready.store(true);
             }
             st->metadata_cv.notify_all();
+            BLIZ_LOG("metadata_received -> token=%s notified", token.c_str());
+            ++matched;
         }
+    }
+    if (matched == 0) {
+        BLIZ_LOG("metadata_received — no matching stream found (handle registered late?)");
     }
 }
 
 void BlizSessionImpl::on_metadata_failed(lt::metadata_failed_alert* a) {
+    BLIZ_LOG("metadata_failed alert");
     std::lock_guard<std::mutex> lock(streams_mutex_);
     for (auto& [token, st] : streams_) {
         if (st->handle == a->handle) {
@@ -333,6 +374,7 @@ void BlizSessionImpl::on_metadata_failed(lt::metadata_failed_alert* a) {
                 st->metadata_failed.store(true);
             }
             st->metadata_cv.notify_all();
+            BLIZ_LOG("metadata_failed -> token=%s notified", token.c_str());
         }
     }
 }
@@ -519,6 +561,12 @@ bool BlizSessionImpl::serve_range(sock_t sock, StreamState& stream,
 std::vector<char> BlizSessionImpl::wait_for_piece(StreamState& stream,
                                                    int piece_idx,
                                                    uint64_t seek_gen) {
+    /* Check if torrent is paused — if so, log a warning immediately */
+    if (stream.handle.flags() & lt::torrent_flags::paused) {
+        BLIZ_LOG("wait_for_piece(%d) WARNING: torrent is PAUSED — piece will never arrive",
+                 piece_idx);
+    }
+
     /* If we already have this piece, read it directly */
     if (stream.handle.have_piece(lt::piece_index_t(piece_idx))) {
         std::future<std::vector<char>> future;
@@ -576,6 +624,9 @@ std::vector<char> BlizSessionImpl::wait_for_piece(StreamState& stream,
         }
     }
 
+    BLIZ_LOG("wait_for_piece(%d) TIMEOUT after %dms — paused=%s",
+             piece_idx, PIECE_TIMEOUT_MS,
+             (stream.handle.flags() & lt::torrent_flags::paused) ? "YES" : "no");
     std::lock_guard<std::mutex> lock(stream.waiters_mutex);
     stream.waiters.erase(piece_idx);
     return {};
@@ -685,33 +736,39 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
         if (progress_fn) progress_fn(p, s, userdata);
     };
 
+    BLIZ_LOG("prepare() start — file_idx=%d has_torrent_data=%s",
+             file_idx, (torrent_data && torrent_len > 0) ? "yes" : "no");
+
     try {
         lt::add_torrent_params atp = make_atp(magnet, torrent_data, torrent_len);
+        BLIZ_LOG("prepare() atp built");
 
         std::string token = generate_token();
         auto st = std::make_shared<StreamState>();
         st->file_idx = file_idx;
 
         report(0.05f, "Connecting to swarm...");
+        BLIZ_LOG("prepare(%s) add_torrent...", token.c_str());
         lt::torrent_handle handle = session_.add_torrent(atp);
         st->handle = handle;
+        BLIZ_LOG("prepare(%s) add_torrent done — valid=%s paused=%s",
+                 token.c_str(),
+                 handle.is_valid() ? "yes" : "no",
+                 (handle.flags() & lt::torrent_flags::paused) ? "YES (WARNING)" : "no");
 
         /* Check for immediately-available metadata (torrent data provided,
            not a magnet-only add).  libtorrent does NOT fire
-           metadata_received_alert when atp.ti is already set, so we must
-           grab torrent_file() here before entering the condition-variable
-           wait to avoid a 30-second timeout. */
+           metadata_received_alert when atp.ti is already set. */
         {
             auto ti_immed = handle.torrent_file();
             if (ti_immed) {
                 st->ti = ti_immed;
                 st->metadata_ready.store(true, std::memory_order_release);
+                BLIZ_LOG("prepare(%s) metadata immediate (torrent data path)", token.c_str());
             }
         }
 
-        /* Now register the stream so on_metadata_received can signal it.
-           Done AFTER handle is set so the alert handler always sees a
-           valid handle. */
+        /* Register the stream (handle already set above). */
         {
             std::lock_guard<std::mutex> lock(streams_mutex_);
             streams_[token] = st;
@@ -719,6 +776,8 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
 
         /* ── Wait for metadata using condition variable (magnet-only path) */
         if (!st->metadata_ready.load(std::memory_order_acquire)) {
+            BLIZ_LOG("prepare(%s) waiting for metadata (magnet path, timeout=%ds)...",
+                     token.c_str(), METADATA_TIMEOUT_S);
             report(0.08f, "Resolving metadata...");
             std::unique_lock<std::mutex> lk(st->metadata_mtx);
             bool signalled = st->metadata_cv.wait_for(
@@ -733,9 +792,17 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
                 auto ti = handle.torrent_file();
                 if (ti) { st->ti = ti; st->metadata_ready.store(true); }
             }
+
+            if (st->metadata_failed.load())
+                BLIZ_LOG("prepare(%s) metadata FAILED", token.c_str());
+            else if (st->metadata_ready.load())
+                BLIZ_LOG("prepare(%s) metadata received via alert", token.c_str());
+            else
+                BLIZ_LOG("prepare(%s) metadata TIMED OUT after %ds", token.c_str(), METADATA_TIMEOUT_S);
         }
 
         if (!st->metadata_ready.load()) {
+            BLIZ_LOG("prepare(%s) FAIL: metadata not ready, removing torrent", token.c_str());
             session_.remove_torrent(handle);
             std::lock_guard<std::mutex> lock(streams_mutex_);
             streams_.erase(token);
@@ -750,6 +817,7 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
         }
 
         if (!st->ti) {
+            BLIZ_LOG("prepare(%s) FAIL: torrent_file() null after metadata ready", token.c_str());
             session_.remove_torrent(handle);
             std::lock_guard<std::mutex> lock(streams_mutex_);
             streams_.erase(token);
@@ -762,7 +830,11 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
         auto& files     = st->ti->files();
         int   num_files = files.num_files();
 
+        BLIZ_LOG("prepare(%s) torrent has %d files, requesting file_idx=%d",
+                 token.c_str(), num_files, file_idx);
+
         if (file_idx < 0 || file_idx >= num_files) {
+            BLIZ_LOG("prepare(%s) FAIL: file_idx %d out of range", token.c_str(), file_idx);
             session_.remove_torrent(handle);
             std::lock_guard<std::mutex> lock(streams_mutex_);
             streams_.erase(token);
@@ -782,26 +854,41 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
         st->first_piece = (int)(st->file_offset / piece_len);
         st->last_piece  = (int)((st->file_offset + st->file_size - 1) / piece_len);
 
+        BLIZ_LOG("prepare(%s) file=%s size=%lld mime=%s pieces=[%d..%d] piece_len=%d",
+                 token.c_str(),
+                 files.file_name(lt::file_index_t(file_idx)).to_string().c_str(),
+                 (long long)st->file_size,
+                 st->mime_type.c_str(),
+                 st->first_piece, st->last_piece, piece_len);
+
         /* ── Pin file priorities ──────────────────────────────────────── */
         std::vector<lt::download_priority_t> file_prios(
             (size_t)num_files, lt::dont_download);
         file_prios[(size_t)file_idx] = lt::top_priority;
         handle.prioritize_files(file_prios);
 
+        /* If the torrent was paused (e.g. released previously), resume it. */
+        if (handle.flags() & lt::torrent_flags::paused) {
+            BLIZ_LOG("prepare(%s) torrent was paused — resuming", token.c_str());
+        }
         handle.resume();
 
         /* ── Fast-start: prime deadline on first HIGH_PRIORITY_PIECES ─── */
         report(0.60f, "Buffering...");
+        int primed = 0;
         for (int i = st->first_piece;
              i < std::min(st->first_piece + HIGH_PRIORITY_PIECES, st->last_piece + 1);
              ++i) {
             handle.set_piece_deadline(lt::piece_index_t(i), 0);
+            ++primed;
         }
+        BLIZ_LOG("prepare(%s) fast-start: primed %d pieces, waiting for piece %d...",
+                 token.c_str(), primed, st->first_piece);
 
-        /* Wait until the very first piece is ready (up to FAST_START_TIMEOUT_MS).
-           This prevents the HTTP client from stalling on its first read. */
-        auto fast_start_dl = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(FAST_START_TIMEOUT_MS);
+        /* Wait until the very first piece is ready (up to FAST_START_TIMEOUT_MS). */
+        auto fast_start_begin = std::chrono::steady_clock::now();
+        auto fast_start_dl    = fast_start_begin +
+                                std::chrono::milliseconds(FAST_START_TIMEOUT_MS);
         while (std::chrono::steady_clock::now() < fast_start_dl) {
             if (handle.have_piece(lt::piece_index_t(st->first_piece))) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -811,6 +898,13 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
             report(0.60f + (elapsed_ms / FAST_START_TIMEOUT_MS) * 0.35f,
                    "Buffering...");
         }
+
+        bool piece0_ready = handle.have_piece(lt::piece_index_t(st->first_piece));
+        auto elapsed_fast = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - fast_start_begin).count();
+        BLIZ_LOG("prepare(%s) fast-start done in %lldms — piece %d ready=%s",
+                 token.c_str(), (long long)elapsed_fast,
+                 st->first_piece, piece0_ready ? "YES" : "NO (continuing anyway)");
 
         /* ── Start priority worker ────────────────────────────────────── */
         st->priority_thread = std::thread([this, st]() {
@@ -828,7 +922,10 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
         info.file_size = st->file_size;
         info.error     = BLIZ_OK;
 
+        BLIZ_LOG("prepare(%s) SUCCESS — url=%s", token.c_str(), info.url);
+
     } catch (const std::exception& e) {
+        BLIZ_LOG("prepare() EXCEPTION: %s", e.what());
         info.error = BLIZ_ERR_INTERNAL;
         snprintf(info.error_msg, sizeof(info.error_msg), "%s", e.what());
     }
@@ -939,11 +1036,15 @@ void BlizSessionImpl::notify_position(const std::string& token,
 }
 
 void BlizSessionImpl::release_stream(const std::string& token) {
+    BLIZ_LOG("release_stream(%s) start", token.c_str());
     std::shared_ptr<StreamState> st;
     {
         std::lock_guard<std::mutex> lock(streams_mutex_);
         auto it = streams_.find(token);
-        if (it == streams_.end()) return;
+        if (it == streams_.end()) {
+            BLIZ_LOG("release_stream(%s) token not found — already released?", token.c_str());
+            return;
+        }
         st = it->second;
         streams_.erase(it);
     }
@@ -952,15 +1053,22 @@ void BlizSessionImpl::release_stream(const std::string& token) {
     /* bump generation so any blocking serve_range/wait_for_piece exits */
     st->seek_generation.fetch_add(1, std::memory_order_release);
 
+    BLIZ_LOG("release_stream(%s) joining priority_thread...", token.c_str());
+    auto t0 = std::chrono::steady_clock::now();
     if (st->priority_thread.joinable())
         st->priority_thread.join();
+    auto join_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    BLIZ_LOG("release_stream(%s) priority_thread joined in %lldms", token.c_str(), (long long)join_ms);
 
     if (st->handle.is_valid()) {
         st->handle.pause();
         std::lock_guard<std::mutex> lock(idle_mutex_);
         idle_torrents_.push_back({st->handle,
                                   std::chrono::steady_clock::now()});
+        BLIZ_LOG("release_stream(%s) torrent paused and moved to idle cache", token.c_str());
     }
+    BLIZ_LOG("release_stream(%s) done", token.c_str());
 }
 
 void BlizSessionImpl::evict() {
