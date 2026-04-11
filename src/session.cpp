@@ -165,14 +165,21 @@ static std::string extract_token(const std::string& path) {
  * ════════════════════════════════════════════════════════════════════════ */
 
 BlizSessionImpl::BlizSessionImpl(const BlizConfig& cfg)
-    : cfg_(cfg), session_(lt::settings_pack{})
+    /* Copy storage_path into an owned std::string FIRST so we don't hold
+       a raw pointer into Rust memory that will be dropped after this call
+       returns.  cfg_.storage_path is never read after construction. */
+    : storage_path_(cfg.storage_path ? cfg.storage_path : ""),
+      cfg_(cfg),
+      session_(lt::settings_pack{})
 {
+    cfg_.storage_path = nullptr; /* intentionally nulled — use storage_path_ */
+
     winsock_init();
 
     if (cfg_.cache_max_bytes == 0) cfg_.cache_max_bytes = 50ULL * 1024 * 1024 * 1024;
     if (cfg_.cache_ttl_secs  == 0) cfg_.cache_ttl_secs  = 3600;
 
-    fs::create_directories(cfg_.storage_path);
+    fs::create_directories(storage_path_);
 
     init_session();
 
@@ -654,7 +661,7 @@ lt::add_torrent_params BlizSessionImpl::make_atp(const char*    magnet,
         throw std::runtime_error("no magnet or torrent data");
     }
 
-    atp.save_path = cfg_.storage_path;
+    atp.save_path = storage_path_;
     atp.flags |= lt::torrent_flags::sequential_download;
     atp.flags &= ~lt::torrent_flags::auto_managed;
     atp.flags &= ~lt::torrent_flags::paused;

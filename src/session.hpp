@@ -134,6 +134,9 @@ private:
     static std::string detect_mime(const std::string& filename);
 
     /* ── members ─────────────────────────────────────────────────────── */
+    /* storage_path_ owns the path string so cfg_.storage_path doesn't
+       dangle after the caller's CString is dropped on the Rust side. */
+    std::string storage_path_;
     BlizConfig  cfg_;
     lt::session session_;
     uint16_t    http_port_{0};
