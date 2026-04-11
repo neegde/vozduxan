@@ -692,18 +692,34 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
         auto st = std::make_shared<StreamState>();
         st->file_idx = file_idx;
 
+        report(0.05f, "Connecting to swarm...");
+        lt::torrent_handle handle = session_.add_torrent(atp);
+        st->handle = handle;
+
+        /* Check for immediately-available metadata (torrent data provided,
+           not a magnet-only add).  libtorrent does NOT fire
+           metadata_received_alert when atp.ti is already set, so we must
+           grab torrent_file() here before entering the condition-variable
+           wait to avoid a 30-second timeout. */
+        {
+            auto ti_immed = handle.torrent_file();
+            if (ti_immed) {
+                st->ti = ti_immed;
+                st->metadata_ready.store(true, std::memory_order_release);
+            }
+        }
+
+        /* Now register the stream so on_metadata_received can signal it.
+           Done AFTER handle is set so the alert handler always sees a
+           valid handle. */
         {
             std::lock_guard<std::mutex> lock(streams_mutex_);
             streams_[token] = st;
         }
 
-        report(0.05f, "Connecting to swarm...");
-        lt::torrent_handle handle = session_.add_torrent(atp);
-        st->handle = handle;
-
-        /* ── Wait for metadata using condition variable ───────────────── */
-        report(0.08f, "Resolving metadata...");
-        {
+        /* ── Wait for metadata using condition variable (magnet-only path) */
+        if (!st->metadata_ready.load(std::memory_order_acquire)) {
+            report(0.08f, "Resolving metadata...");
             std::unique_lock<std::mutex> lk(st->metadata_mtx);
             bool signalled = st->metadata_cv.wait_for(
                 lk,
@@ -711,12 +727,12 @@ BlizStreamInfo BlizSessionImpl::prepare(const char*    magnet,
                 [&]{ return st->metadata_ready.load() || st->metadata_failed.load(); }
             );
             (void)signalled;
-        }
 
-        /* Also try torrent_file() as fallback (for .torrent files that skip the alert) */
-        if (!st->metadata_ready.load()) {
-            auto ti = handle.torrent_file();
-            if (ti) { st->ti = ti; st->metadata_ready.store(true); }
+            /* Last-chance fallback in case alert fired before stream was registered */
+            if (!st->metadata_ready.load()) {
+                auto ti = handle.torrent_file();
+                if (ti) { st->ti = ti; st->metadata_ready.store(true); }
+            }
         }
 
         if (!st->metadata_ready.load()) {
@@ -834,30 +850,37 @@ BlizFileList BlizSessionImpl::list_files(const char*    magnet,
 
         auto st = std::make_shared<StreamState>();
         std::string token = "list-" + generate_token();
-        {
-            std::lock_guard<std::mutex> lock(streams_mutex_);
-            streams_[token] = st;
-        }
 
         lt::torrent_handle handle = session_.add_torrent(atp);
         st->handle = handle;
 
+        /* Immediate check for torrent-data case (no alert fired) */
         {
+            auto ti_immed = handle.torrent_file();
+            if (ti_immed) {
+                st->ti = ti_immed;
+                st->metadata_ready.store(true, std::memory_order_release);
+            }
+        }
+
+        if (!st->metadata_ready.load(std::memory_order_acquire)) {
+            {
+                std::lock_guard<std::mutex> lock(streams_mutex_);
+                streams_[token] = st;
+            }
+
             std::unique_lock<std::mutex> lk(st->metadata_mtx);
             st->metadata_cv.wait_for(
                 lk,
                 std::chrono::seconds(METADATA_TIMEOUT_S),
                 [&]{ return st->metadata_ready.load() || st->metadata_failed.load(); }
             );
-        }
 
-        /* fallback for .torrent files */
-        if (!st->metadata_ready.load()) {
-            auto ti = handle.torrent_file();
-            if (ti) { st->ti = ti; st->metadata_ready.store(true); }
-        }
+            if (!st->metadata_ready.load()) {
+                auto ti = handle.torrent_file();
+                if (ti) { st->ti = ti; st->metadata_ready.store(true); }
+            }
 
-        {
             std::lock_guard<std::mutex> lock(streams_mutex_);
             streams_.erase(token);
         }
