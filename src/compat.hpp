@@ -10,7 +10,11 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  include <BaseTsd.h>
 #  pragma comment(lib, "ws2_32.lib")
+
+   /* POSIX ssize_t; Winsock uses SSIZE_T from BaseTsd.h */
+   using ssize_t = SSIZE_T;
 
    /* socket handle type */
    using sock_t = SOCKET;
