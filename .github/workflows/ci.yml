@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest
+          - os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libtorrent (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtorrent-rasterbar-dev build-essential cmake
+
+      - name: Install libtorrent (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libtorrent-rasterbar
+
+      # Windows: no system libtorrent — CMakeLists.txt falls back to FetchContent (slow but works)
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j4
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish tag & release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -e
+          REPO="${{ github.repository }}"
+
+          VERSION=$(grep -m1 "^project(vozduxan VERSION" CMakeLists.txt \
+            | sed 's/.*VERSION \([0-9][0-9.]*\).*/\1/')
+
+          if [ "$REF_NAME" = "dev" ]; then
+            TAG="v${VERSION}-dev"
+            PRERELEASE=(--prerelease)
+          else
+            TAG="v${VERSION}"
+            PRERELEASE=()
+          fi
+
+          gh release delete "$TAG" --repo "$REPO" --yes 2>/dev/null || true
+          gh api --method DELETE -H "Accept: application/vnd.github+json" \
+            "/repos/$REPO/git/refs/tags/$TAG" 2>/dev/null || true
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --target "${{ github.sha }}" \
+            --title "$TAG" \
+            --notes "vozduxan ${TAG}" \
+            "${PRERELEASE[@]}"
