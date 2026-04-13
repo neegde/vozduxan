@@ -25,6 +25,9 @@
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/error_code.hpp>
+#include <libtorrent/bencode.hpp>
+#include <libtorrent/bdecode.hpp>
+#include <libtorrent/entry.hpp>
 #include <libtorrent/extensions/ut_pex.hpp>
 #include <libtorrent/extensions/ut_metadata.hpp>
 #include <libtorrent/extensions/smart_ban.hpp>
@@ -36,11 +39,25 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <sstream>
 
 namespace vozduxan {
 namespace fs = std::filesystem;
+
+/* Well-known open trackers appended to every torrent so thin-seeded
+   magnets can still find peers via UDP announces.                    */
+static const std::vector<std::string> OPEN_TRACKERS = {
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.tiny-vps.com:6969/announce",
+    "udp://explodie.org:6969/announce",
+};
 
 namespace {
 
@@ -242,8 +259,10 @@ VozduxanSessionImpl::VozduxanSessionImpl(const VozduxanConfig& cfg)
     if (cfg_.cache_ttl_secs  == 0) cfg_.cache_ttl_secs  = 3600;
 
     fs::create_directories(storage_path_);
+    dht_state_path_ = (fs::path(storage_path_) / "dht_state.dat").string();
 
     init_session();
+    load_dht_state();
 
     alert_thread_ = std::thread([this]{ alert_loop(); });
     http_thread_  = std::thread([this]{ http_server_loop(); });
@@ -256,6 +275,7 @@ VozduxanSessionImpl::VozduxanSessionImpl(const VozduxanConfig& cfg)
 }
 
 VozduxanSessionImpl::~VozduxanSessionImpl() {
+    save_dht_state();
     running_.store(false);
     session_.abort();
 
@@ -332,6 +352,42 @@ void VozduxanSessionImpl::init_session() {
     session_.add_extension(&lt::create_ut_pex_plugin);
     session_.add_extension(&lt::create_ut_metadata_plugin);
     session_.add_extension(&lt::create_smart_ban_plugin);
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  DHT state persistence
+ * ════════════════════════════════════════════════════════════════════════ */
+
+void VozduxanSessionImpl::load_dht_state() {
+    std::ifstream f(dht_state_path_, std::ios::binary);
+    if (!f) return;
+    std::string buf((std::istreambuf_iterator<char>(f)), {});
+    lt::error_code ec;
+    lt::bdecode_node n;
+    lt::bdecode(lt::span<char const>(buf.data(), (int)buf.size()), n, ec);
+    if (ec) {
+        VOZDUXAN_LOG("load_dht_state: bdecode error: %s", ec.message().c_str());
+        return;
+    }
+    session_.load_state(n, lt::session::save_dht_state);
+    VOZDUXAN_LOG("load_dht_state: loaded %zu bytes from %s",
+                 buf.size(), dht_state_path_.c_str());
+}
+
+void VozduxanSessionImpl::save_dht_state() {
+    if (dht_state_path_.empty()) return;
+    lt::entry e;
+    session_.save_state(e, lt::session::save_dht_state);
+    std::vector<char> buf;
+    lt::bencode(std::back_inserter(buf), e);
+    std::ofstream f(dht_state_path_, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        VOZDUXAN_LOG("save_dht_state: cannot open %s for writing", dht_state_path_.c_str());
+        return;
+    }
+    f.write(buf.data(), (std::streamsize)buf.size());
+    VOZDUXAN_LOG("save_dht_state: saved %zu bytes to %s",
+                 buf.size(), dht_state_path_.c_str());
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -757,6 +813,13 @@ lt::add_torrent_params VozduxanSessionImpl::make_atp(const char*    magnet,
     atp.flags &= ~lt::torrent_flags::auto_managed;
     atp.flags &= ~lt::torrent_flags::paused;
 
+    /* Append open trackers so thin-seeded torrents can find peers. */
+    for (const auto& url : OPEN_TRACKERS)
+        atp.trackers.push_back(url);
+
+    /* Cap connections per torrent to avoid hammering low-seeder swarms. */
+    atp.max_connections = 100;
+
     return atp;
 }
 
@@ -795,6 +858,7 @@ VozduxanStreamInfo VozduxanSessionImpl::prepare(const char*    magnet,
                  token.c_str(),
                  handle.is_valid() ? "yes" : "no",
                  (handle.flags() & lt::torrent_flags::paused) ? "YES (WARNING)" : "no");
+        handle.force_reannounce(0); /* announce immediately; don't wait for tracker interval */
 
         /* Check for immediately-available metadata (torrent data provided,
            not a magnet-only add).  libtorrent does NOT fire

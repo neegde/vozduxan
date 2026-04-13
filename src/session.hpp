@@ -106,6 +106,8 @@ public:
 private:
     /* libtorrent session setup */
     void init_session();
+    void load_dht_state();
+    void save_dht_state();
 
     /* alert processing thread */
     void alert_loop();
@@ -140,6 +142,7 @@ private:
     /* storage_path_ owns the path string so cfg_.storage_path doesn't
        dangle after the caller's CString is dropped on the Rust side. */
     std::string storage_path_;
+    std::string dht_state_path_; /* path to persisted DHT routing table */
     VozduxanConfig  cfg_;
     lt::session session_;
     uint16_t    http_port_{0};
