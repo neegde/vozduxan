@@ -37,6 +37,20 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libtorrent-rasterbar
 
+      # Windows: libtorrent pulls a large Boost/OpenSSL graph. Without a cache each
+      # job rebuilds from source (~20–40+ minutes). installed/ + downloads/ restore
+      # makes vcpkg install a no-op on hits.
+      - name: Cache vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:/vcpkg/installed
+            C:/vcpkg/downloads
+          key: vcpkg-x64-windows-static-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            vcpkg-x64-windows-static-
+
       - name: Install libtorrent (Windows)
         if: runner.os == 'Windows'
         run: vcpkg install libtorrent:x64-windows-static
