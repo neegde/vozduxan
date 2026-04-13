@@ -1,6 +1,6 @@
 /**
- * blizorukost — api.cpp
- * Thin C wrapper around BlizSessionImpl.
+ * vozduxan — api.cpp
+ * Thin C wrapper around VozduxanSessionImpl.
  * All exceptions are caught here so nothing crosses the FFI boundary.
  */
 
@@ -9,26 +9,26 @@
 #include <cstring>
 #include <new>
 
-using namespace bliz;
+using namespace vozduxan;
 
-struct BlizSession : public BlizSessionImpl {
-    using BlizSessionImpl::BlizSessionImpl;
+struct VozduxanSession : public VozduxanSessionImpl {
+    using VozduxanSessionImpl::VozduxanSessionImpl;
 };
 
 /* ════════════════════════════════════════════════════════════════════════
  *  Session lifecycle
  * ════════════════════════════════════════════════════════════════════════ */
 
-BlizSession* bliz_session_create(const BlizConfig* config) {
+VozduxanSession* vozduxan_session_create(const VozduxanConfig* config) {
     if (!config) return nullptr;
     try {
-        return new BlizSession(*config);
+        return new VozduxanSession(*config);
     } catch (...) {
         return nullptr;
     }
 }
 
-void bliz_session_destroy(BlizSession* session) {
+void vozduxan_session_destroy(VozduxanSession* session) {
     delete session;
 }
 
@@ -36,16 +36,16 @@ void bliz_session_destroy(BlizSession* session) {
  *  Streaming
  * ════════════════════════════════════════════════════════════════════════ */
 
-BlizStreamInfo bliz_stream_prepare(BlizSession*   session,
+VozduxanStreamInfo vozduxan_stream_prepare(VozduxanSession*   session,
                                     const char*    magnet,
                                     const uint8_t* torrent_data,
                                     size_t         torrent_len,
                                     int            file_idx,
-                                    BlizProgressFn progress_fn,
+                                    VozduxanProgressFn progress_fn,
                                     void*          userdata) {
-    BlizStreamInfo info{};
+    VozduxanStreamInfo info{};
     if (!session) {
-        info.error = BLIZ_ERR_BAD_INPUT;
+        info.error = VOZDUXAN_ERR_BAD_INPUT;
         snprintf(info.error_msg, sizeof(info.error_msg), "null session");
         return info;
     }
@@ -53,13 +53,13 @@ BlizStreamInfo bliz_stream_prepare(BlizSession*   session,
         return session->prepare(magnet, torrent_data, torrent_len,
                                 file_idx, progress_fn, userdata);
     } catch (const std::exception& e) {
-        info.error = BLIZ_ERR_INTERNAL;
+        info.error = VOZDUXAN_ERR_INTERNAL;
         snprintf(info.error_msg, sizeof(info.error_msg), "%s", e.what());
         return info;
     }
 }
 
-void bliz_stream_notify_position(BlizSession* session,
+void vozduxan_stream_notify_position(VozduxanSession* session,
                                   const char*  token,
                                   int64_t      byte_offset) {
     if (!session || !token) return;
@@ -67,7 +67,7 @@ void bliz_stream_notify_position(BlizSession* session,
     catch (...) {}
 }
 
-void bliz_stream_release(BlizSession* session, const char* token) {
+void vozduxan_stream_release(VozduxanSession* session, const char* token) {
     if (!session || !token) return;
     try { session->release_stream(token); }
     catch (...) {}
@@ -77,26 +77,26 @@ void bliz_stream_release(BlizSession* session, const char* token) {
  *  File listing
  * ════════════════════════════════════════════════════════════════════════ */
 
-BlizFileList bliz_list_files(BlizSession*   session,
+VozduxanFileList vozduxan_list_files(VozduxanSession*   session,
                               const char*    magnet,
                               const uint8_t* torrent_data,
                               size_t         torrent_len) {
-    BlizFileList result{};
+    VozduxanFileList result{};
     if (!session) {
-        result.error = BLIZ_ERR_BAD_INPUT;
+        result.error = VOZDUXAN_ERR_BAD_INPUT;
         snprintf(result.error_msg, sizeof(result.error_msg), "null session");
         return result;
     }
     try {
         return session->list_files(magnet, torrent_data, torrent_len);
     } catch (const std::exception& e) {
-        result.error = BLIZ_ERR_INTERNAL;
+        result.error = VOZDUXAN_ERR_INTERNAL;
         snprintf(result.error_msg, sizeof(result.error_msg), "%s", e.what());
         return result;
     }
 }
 
-void bliz_file_list_free(BlizFileList* list) {
+void vozduxan_file_list_free(VozduxanFileList* list) {
     if (!list) return;
     delete[] list->files;
     list->files = nullptr;
@@ -107,13 +107,13 @@ void bliz_file_list_free(BlizFileList* list) {
  *  Cache / misc
  * ════════════════════════════════════════════════════════════════════════ */
 
-void bliz_session_evict(BlizSession* session) {
+void vozduxan_session_evict(VozduxanSession* session) {
     if (!session) return;
     try { session->evict(); }
     catch (...) {}
 }
 
-uint16_t bliz_session_http_port(BlizSession* session) {
+uint16_t vozduxan_session_http_port(VozduxanSession* session) {
     if (!session) return 0;
     return session->http_port();
 }

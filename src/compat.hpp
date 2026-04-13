@@ -1,5 +1,5 @@
 /**
- * blizorukost — compat.hpp
+ * vozduxan — compat.hpp
  * Cross-platform socket abstraction (POSIX / Winsock2).
  */
 #pragma once
@@ -26,7 +26,7 @@
 
    /* WSAPoll has the same signature as POSIX poll */
 #  include <winsock2.h>
-   inline int bliz_poll(struct pollfd* fds, unsigned long nfds, int timeout_ms) {
+   inline int vozduxan_poll(struct pollfd* fds, unsigned long nfds, int timeout_ms) {
        return WSAPoll(fds, nfds, timeout_ms);
    }
 
@@ -52,7 +52,7 @@
    inline void close_sock(sock_t s)    { close(s); }
    inline void shutdown_sock(sock_t s) { shutdown(s, SHUT_RDWR); }
 
-   inline int bliz_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
+   inline int vozduxan_poll(struct pollfd* fds, nfds_t nfds, int timeout_ms) {
        return poll(fds, nfds, timeout_ms);
    }
 

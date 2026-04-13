@@ -22,9 +22,9 @@
 #include <vector>
 
 #include "compat.hpp"
-#include "../include/blizorukost.h"
+#include "../include/vozduxan.h"
 
-namespace bliz {
+namespace vozduxan {
 
 namespace lt = libtorrent;
 
@@ -82,19 +82,19 @@ struct IdleTorrent {
 };
 
 /* ── Main session class ────────────────────────────────────────────────── */
-class BlizSessionImpl {
+class VozduxanSessionImpl {
 public:
-    explicit BlizSessionImpl(const BlizConfig& cfg);
-    ~BlizSessionImpl();
+    explicit VozduxanSessionImpl(const VozduxanConfig& cfg);
+    ~VozduxanSessionImpl();
 
-    BlizStreamInfo prepare(const char*    magnet,
+    VozduxanStreamInfo prepare(const char*    magnet,
                            const uint8_t* torrent_data,
                            size_t         torrent_len,
                            int            file_idx,
-                           BlizProgressFn progress_fn,
+                           VozduxanProgressFn progress_fn,
                            void*          userdata);
 
-    BlizFileList list_files(const char*    magnet,
+    VozduxanFileList list_files(const char*    magnet,
                             const uint8_t* torrent_data,
                             size_t         torrent_len);
 
@@ -140,7 +140,7 @@ private:
     /* storage_path_ owns the path string so cfg_.storage_path doesn't
        dangle after the caller's CString is dropped on the Rust side. */
     std::string storage_path_;
-    BlizConfig  cfg_;
+    VozduxanConfig  cfg_;
     lt::session session_;
     uint16_t    http_port_{0};
     sock_t      server_fd_{kInvalidSock};
@@ -159,8 +159,8 @@ private:
 
     std::atomic<uint32_t> token_counter_{0};
 
-    BlizLogFn   log_fn_{nullptr};
+    VozduxanLogFn   log_fn_{nullptr};
     void*       log_userdata_{nullptr};
 };
 
-} // namespace bliz
+} // namespace vozduxan

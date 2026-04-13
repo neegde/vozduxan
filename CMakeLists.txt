@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(blizorukost VERSION 0.3.0 LANGUAGES CXX)
+project(vozduxan VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,7 +19,7 @@ endif()
 find_package(LibtorrentRasterbar QUIET)
 
 if(NOT LibtorrentRasterbar_FOUND)
-    message(STATUS "[blizorukost] libtorrent not found via CMake; trying pkg-config")
+    message(STATUS "[vozduxan] libtorrent not found via CMake; trying pkg-config")
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(LIBTORRENT IMPORTED_TARGET libtorrent-rasterbar)
@@ -28,7 +28,7 @@ if(NOT LibtorrentRasterbar_FOUND)
     if(LIBTORRENT_FOUND)
         set(LT_TARGET PkgConfig::LIBTORRENT)
     else()
-        message(STATUS "[blizorukost] Fetching libtorrent from GitHub (v2.0.10)")
+        message(STATUS "[vozduxan] Fetching libtorrent from GitHub (v2.0.10)")
         include(FetchContent)
         FetchContent_Declare(
             libtorrent
@@ -46,37 +46,37 @@ else()
     set(LT_TARGET LibtorrentRasterbar::torrent-rasterbar)
 endif()
 
-# ── blizorukost static library ───────────────────────────────────────────
-add_library(blizorukost STATIC
+# ── vozduxan static library ───────────────────────────────────────────
+add_library(vozduxan STATIC
     src/session.cpp
     src/api.cpp
 )
 
-target_include_directories(blizorukost
+target_include_directories(vozduxan
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_link_libraries(blizorukost PRIVATE ${LT_TARGET})
+target_link_libraries(vozduxan PRIVATE ${LT_TARGET})
 
-set_target_properties(blizorukost PROPERTIES
+set_target_properties(vozduxan PROPERTIES
     POSITION_INDEPENDENT_CODE ON
-    OUTPUT_NAME blizorukost
+    OUTPUT_NAME vozduxan
 )
 
 # ── Platform link flags ───────────────────────────────────────────────────
 if(WIN32)
-    target_link_libraries(blizorukost PRIVATE ws2_32 iphlpapi)
+    target_link_libraries(vozduxan PRIVATE ws2_32 iphlpapi)
 elseif(APPLE)
-    target_link_libraries(blizorukost PRIVATE
+    target_link_libraries(vozduxan PRIVATE
         "-framework SystemConfiguration"
         "-framework CoreFoundation"
         "-framework IOKit"
     )
 elseif(UNIX)
-    target_link_libraries(blizorukost PRIVATE pthread)
+    target_link_libraries(vozduxan PRIVATE pthread)
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────
-install(TARGETS blizorukost ARCHIVE DESTINATION lib)
-install(FILES include/blizorukost.h DESTINATION include)
+install(TARGETS vozduxan ARCHIVE DESTINATION lib)
+install(FILES include/vozduxan.h DESTINATION include)

@@ -1,5 +1,5 @@
 /**
- * blizorukost — libtorrent-based streaming engine for neegde
+ * vozduxan — libtorrent-based streaming engine for neegde
  *
  * Implements streaming-optimised BitTorrent using a three-tier piece priority
  * strategy and time-critical mode originally researched by Tribler (TU Delft).
@@ -22,12 +22,12 @@ extern "C" {
 #endif
 
 /* ── Opaque handle ─────────────────────────────────────────────────────── */
-typedef struct BlizSession BlizSession;
+typedef struct VozduxanSession VozduxanSession;
 
 /* ── Log callback ──────────────────────────────────────────────────────── */
 /** Called from any thread; message is a null-terminated UTF-8 string.
  *  NULL disables the callback (logs go to stderr only).                */
-typedef void (*BlizLogFn)(const char* message, void* userdata);
+typedef void (*VozduxanLogFn)(const char* message, void* userdata);
 
 /* ── Configuration ─────────────────────────────────────────────────────── */
 typedef struct {
@@ -35,18 +35,18 @@ typedef struct {
     uint64_t    cache_max_bytes; /* max disk usage; 0 = 50 GB              */
     uint32_t    cache_ttl_secs;  /* idle-torrent TTL; 0 = 3 600 s          */
     int         listen_port;     /* BT listen port; 0 = random             */
-    BlizLogFn   log_fn;          /* optional log callback; NULL = off      */
+    VozduxanLogFn   log_fn;          /* optional log callback; NULL = off      */
     void*       log_userdata;    /* passed verbatim to log_fn              */
-} BlizConfig;
+} VozduxanConfig;
 
 /* ── Error codes ───────────────────────────────────────────────────────── */
 typedef enum {
-    BLIZ_OK                   = 0,
-    BLIZ_ERR_METADATA_TIMEOUT = 1,
-    BLIZ_ERR_INVALID_FILE     = 2,
-    BLIZ_ERR_BAD_INPUT        = 3,
-    BLIZ_ERR_INTERNAL         = 99,
-} BlizError;
+    VOZDUXAN_OK                   = 0,
+    VOZDUXAN_ERR_METADATA_TIMEOUT = 1,
+    VOZDUXAN_ERR_INVALID_FILE     = 2,
+    VOZDUXAN_ERR_BAD_INPUT        = 3,
+    VOZDUXAN_ERR_INTERNAL         = 99,
+} VozduxanError;
 
 /* ── Stream result ─────────────────────────────────────────────────────── */
 typedef struct {
@@ -54,9 +54,9 @@ typedef struct {
     char      token[128];     /* opaque stream identifier                  */
     int64_t   file_size;      /* bytes                                     */
     char      mime_type[64];  /* e.g. "audio/flac"                         */
-    BlizError error;
+    VozduxanError error;
     char      error_msg[256];
-} BlizStreamInfo;
+} VozduxanStreamInfo;
 
 /* ── File entry (for magnet file listing) ──────────────────────────────── */
 typedef struct {
@@ -64,23 +64,23 @@ typedef struct {
     char    mime[64];
     int64_t size;
     int     index;            /* file index within the torrent             */
-} BlizFileEntry;
+} VozduxanFileEntry;
 
 typedef struct {
-    BlizFileEntry* files;
+    VozduxanFileEntry* files;
     int            count;
-    BlizError      error;
+    VozduxanError      error;
     char           error_msg[256];
-} BlizFileList;
+} VozduxanFileList;
 
 /* ── Progress callback ─────────────────────────────────────────────────── */
-typedef void (*BlizProgressFn)(float progress,       /* 0.0 – 1.0         */
+typedef void (*VozduxanProgressFn)(float progress,       /* 0.0 – 1.0         */
                                const char* status,
                                void*       userdata);
 
 /* ── Session lifecycle ─────────────────────────────────────────────────── */
-BlizSession* bliz_session_create(const BlizConfig* config);
-void         bliz_session_destroy(BlizSession* session);
+VozduxanSession* vozduxan_session_create(const VozduxanConfig* config);
+void         vozduxan_session_destroy(VozduxanSession* session);
 
 /* ── Streaming ─────────────────────────────────────────────────────────── */
 
@@ -96,13 +96,13 @@ void         bliz_session_destroy(BlizSession* session);
  * @param progress_fn  Called periodically during metadata resolution
  * @param userdata     Passed verbatim to progress_fn
  */
-BlizStreamInfo bliz_stream_prepare(
-    BlizSession*   session,
+VozduxanStreamInfo vozduxan_stream_prepare(
+    VozduxanSession*   session,
     const char*    magnet,
     const uint8_t* torrent_data,
     size_t         torrent_len,
     int            file_idx,
-    BlizProgressFn progress_fn,
+    VozduxanProgressFn progress_fn,
     void*          userdata
 );
 
@@ -111,7 +111,7 @@ BlizStreamInfo bliz_stream_prepare(
  * Call on every seek / position update.
  * The priority worker uses this to slide the high-priority window.
  */
-void bliz_stream_notify_position(BlizSession*  session,
+void vozduxan_stream_notify_position(VozduxanSession*  session,
                                  const char*   token,
                                  int64_t       byte_offset);
 
@@ -119,30 +119,30 @@ void bliz_stream_notify_position(BlizSession*  session,
  * Release a stream token.  The torrent stays cached on disk.
  * Any ongoing HTTP connection to this token will be closed.
  */
-void bliz_stream_release(BlizSession* session, const char* token);
+void vozduxan_stream_release(VozduxanSession* session, const char* token);
 
 /* ── File listing ──────────────────────────────────────────────────────── */
 
 /**
  * Resolve metadata and return the file list.
- * Call bliz_file_list_free() when done.
+ * Call vozduxan_file_list_free() when done.
  */
-BlizFileList bliz_list_files(
-    BlizSession*   session,
+VozduxanFileList vozduxan_list_files(
+    VozduxanSession*   session,
     const char*    magnet,
     const uint8_t* torrent_data,
     size_t         torrent_len
 );
 
-void bliz_file_list_free(BlizFileList* list);
+void vozduxan_file_list_free(VozduxanFileList* list);
 
 /* ── Cache management ──────────────────────────────────────────────────── */
 
 /** Remove from session all idle (released) torrents past TTL; keep disk data. */
-void bliz_session_evict(BlizSession* session);
+void vozduxan_session_evict(VozduxanSession* session);
 
 /** HTTP port the internal server is listening on. */
-uint16_t bliz_session_http_port(BlizSession* session);
+uint16_t vozduxan_session_http_port(VozduxanSession* session);
 
 #ifdef __cplusplus
 }
