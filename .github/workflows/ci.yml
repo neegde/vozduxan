@@ -37,11 +37,18 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install libtorrent-rasterbar
 
-      # Windows: no system libtorrent — CMakeLists.txt falls back to FetchContent (slow but works)
+      - name: Install libtorrent (Windows)
+        if: runner.os == 'Windows'
+        run: vcpkg install libtorrent:x64-windows-static
 
       - name: Build
+        shell: bash
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          EXTRA=""
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            EXTRA="-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static"
+          fi
+          cmake -B build -DCMAKE_BUILD_TYPE=Release $EXTRA
           cmake --build build --config Release -j4
 
   release:

@@ -16,7 +16,7 @@ if(APPLE)
 endif()
 
 # ── libtorrent-rasterbar ─────────────────────────────────────────────────
-find_package(LibtorrentRasterbar QUIET)
+find_package(LibtorrentRasterbar CONFIG QUIET)
 
 if(NOT LibtorrentRasterbar_FOUND)
     message(STATUS "[vozduxan] libtorrent not found via CMake; trying pkg-config")
