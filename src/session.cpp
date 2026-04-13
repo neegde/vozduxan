@@ -25,9 +25,8 @@
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/error_code.hpp>
-#include <libtorrent/bencode.hpp>
 #include <libtorrent/bdecode.hpp>
-#include <libtorrent/entry.hpp>
+#include <libtorrent/session_params.hpp>
 #include <libtorrent/extensions/ut_pex.hpp>
 #include <libtorrent/extensions/ut_metadata.hpp>
 #include <libtorrent/extensions/smart_ban.hpp>
@@ -363,23 +362,24 @@ void VozduxanSessionImpl::load_dht_state() {
     if (!f) return;
     std::string buf((std::istreambuf_iterator<char>(f)), {});
     lt::error_code ec;
-    lt::bdecode_node n;
-    lt::bdecode(lt::span<char const>(buf.data(), (int)buf.size()), n, ec);
+    lt::bdecode_node const n = lt::bdecode(
+        lt::span<char const>(buf.data(), static_cast<int>(buf.size())), ec);
     if (ec) {
         VOZDUXAN_LOG("load_dht_state: bdecode error: %s", ec.message().c_str());
         return;
     }
-    session_.load_state(n, lt::session::save_dht_state);
+    lt::session_params sp = lt::read_session_params(n, lt::session::save_dht_state);
+    session_.set_dht_state(std::move(sp.dht_state));
     VOZDUXAN_LOG("load_dht_state: loaded %zu bytes from %s",
                  buf.size(), dht_state_path_.c_str());
 }
 
 void VozduxanSessionImpl::save_dht_state() {
     if (dht_state_path_.empty()) return;
-    lt::entry e;
-    session_.save_state(e, lt::session::save_dht_state);
-    std::vector<char> buf;
-    lt::bencode(std::back_inserter(buf), e);
+    lt::session_params const sp =
+        session_.session_state(lt::session::save_dht_state);
+    std::vector<char> const buf =
+        lt::write_session_params_buf(sp, lt::session::save_dht_state);
     std::ofstream f(dht_state_path_, std::ios::binary | std::ios::trunc);
     if (!f) {
         VOZDUXAN_LOG("save_dht_state: cannot open %s for writing", dht_state_path_.c_str());
