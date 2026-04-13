@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(vozduxan VERSION 1.0.0 LANGUAGES CXX)
+project(vozduxan VERSION 1.0.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -40,7 +40,9 @@ if(NOT LibtorrentRasterbar_FOUND)
         set(deprecated-functions            OFF CACHE BOOL "" FORCE)
         set(CMAKE_POSITION_INDEPENDENT_CODE ON)
         FetchContent_MakeAvailable(libtorrent)
-        set(LT_TARGET LibtorrentRasterbar::torrent-rasterbar)
+        # In-tree build exposes `torrent-rasterbar` only; the LibtorrentRasterbar::
+        # namespaced target exists after install/export, not in FetchContent.
+        set(LT_TARGET torrent-rasterbar)
     endif()
 else()
     set(LT_TARGET LibtorrentRasterbar::torrent-rasterbar)
