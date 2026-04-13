@@ -1,8 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
-project(vozduxan VERSION 1.0.1 LANGUAGES CXX)
+project(vozduxan VERSION 1.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# std::filesystem (libc++) is annotated for macOS 10.15+; align with neegde-tauri build.rs / bundle.
+if(APPLE)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version" FORCE)
+endif()
 
 # ── Homebrew search paths (macOS arm64 / x86_64) ─────────────────────────
 if(APPLE)

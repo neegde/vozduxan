@@ -21,6 +21,7 @@
 
 #include "session.hpp"
 
+#include <libtorrent/config.hpp>
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
@@ -327,8 +328,12 @@ void VozduxanSessionImpl::init_session() {
     /* Upload slots — Give-to-Get: maintain unchoke reciprocity */
     sp.set_int(lt::settings_pack::unchoke_slots_limit, 8);
 
-    /* Read-ahead line size: 32 pieces (libtorrent 2.x) */
+    /* Read-ahead line size: 32 blocks (name differs when TORRENT_ABI_VERSION > 2). */
+#if TORRENT_ABI_VERSION <= 2
     sp.set_int(lt::settings_pack::read_cache_line_size, 32);
+#else
+    sp.set_int(lt::settings_pack::deprecated_read_cache_line_size, 32);
+#endif
 
     /* DHT + LSD for peer discovery */
     sp.set_bool(lt::settings_pack::enable_dht,   true);
