@@ -1171,11 +1171,31 @@ void VozduxanSessionImpl::release_stream(const std::string& token) {
     VOZDUXAN_LOG("release_stream(%s) priority_thread joined in %lldms", token.c_str(), (long long)join_ms);
 
     if (st->handle.is_valid()) {
-        st->handle.pause();
-        std::lock_guard<std::mutex> lock(idle_mutex_);
-        idle_torrents_.push_back({st->handle,
-                                  std::chrono::steady_clock::now()});
-        VOZDUXAN_LOG("release_stream(%s) torrent paused and moved to idle cache", token.c_str());
+        /* Only pause the torrent if no other active stream is still using the
+         * same underlying torrent handle.  Two streams share a handle when the
+         * second prepare() call gets an AlreadyManaged response from libtorrent
+         * (same info hash, e.g. version-mismatch superseded stream released
+         * while a newer prepare for the same track is still in flight).
+         * Pausing unconditionally kills the torrent for the sibling stream. */
+        bool shared = false;
+        {
+            std::lock_guard<std::mutex> slock(streams_mutex_);
+            for (auto& [tok, other] : streams_) {
+                if (other->handle == st->handle) {
+                    shared = true;
+                    break;
+                }
+            }
+        }
+        if (shared) {
+            VOZDUXAN_LOG("release_stream(%s) torrent NOT paused — still used by another active stream", token.c_str());
+        } else {
+            st->handle.pause();
+            std::lock_guard<std::mutex> lock(idle_mutex_);
+            idle_torrents_.push_back({st->handle,
+                                      std::chrono::steady_clock::now()});
+            VOZDUXAN_LOG("release_stream(%s) torrent paused and moved to idle cache", token.c_str());
+        }
     }
     VOZDUXAN_LOG("release_stream(%s) done", token.c_str());
 }
