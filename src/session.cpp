@@ -292,6 +292,7 @@ VozduxanSessionImpl::~VozduxanSessionImpl() {
         std::lock_guard<std::mutex> lock(streams_mutex_);
         for (auto& [token, st] : streams_) {
             st->stop_flag.store(true);
+            st->abort_http.store(true);
             if (st->priority_thread.joinable()) st->priority_thread.join();
         }
     }
@@ -623,7 +624,7 @@ bool VozduxanSessionImpl::serve_range(sock_t sock, StreamState& stream,
     int64_t pos   = start;
 
     while (pos <= end && running_.load()) {
-        if (stream.stop_flag.load()) return false;
+        if (stream.abort_http.load()) return false;
 
         /* abort if a newer seek has arrived for this stream */
         if (stream.seek_generation.load(std::memory_order_acquire) != gen)
@@ -661,13 +662,25 @@ bool VozduxanSessionImpl::serve_range(sock_t sock, StreamState& stream,
 std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
                                                    int piece_idx,
                                                    uint64_t seek_gen) {
-    /* Check if torrent is paused — if so, log a warning immediately */
+    /* Check if torrent is paused — call resume() so libtorrent can start
+     * downloading.  Something (e.g. prioritize_files() async processing or a
+     * libtorrent "finished" state transition) may have paused the torrent after
+     * prepare() called handle.resume(); we repeat it here as a safety net. */
     if (stream.handle.flags() & lt::torrent_flags::paused) {
-        VOZDUXAN_LOG("wait_for_piece(%d) WARNING: torrent is PAUSED — piece will never arrive",
+        VOZDUXAN_LOG("wait_for_piece(%d) WARNING: torrent is PAUSED — calling resume()",
                  piece_idx);
+        stream.handle.resume();
     }
 
-    /* If we already have this piece, read it directly */
+    /* If we already have this piece, read it directly.
+     *
+     * Use a generous timeout (PIECE_TIMEOUT_MS) rather than a short one.
+     * The disk I/O thread may be busy writing newly-downloaded pieces that
+     * arrived in response to the urgent set_piece_deadline(0) calls made in
+     * prepare() — 20-100+ write jobs ahead of this read job is realistic when
+     * the first piece of a new track is shared (and already on disk) while
+     * pieces 1-N are arriving rapidly.  A 2-second cap was too tight and
+     * caused silent serve_range failures → MEDIA_ERR_SRC_NOT_SUPPORTED. */
     if (stream.handle.have_piece(lt::piece_index_t(piece_idx))) {
         std::future<std::vector<char>> future;
         {
@@ -678,14 +691,18 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
         }
         stream.handle.read_piece(lt::piece_index_t(piece_idx));
 
-        auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(2000);
+        auto t0       = std::chrono::steady_clock::now();
+        auto deadline = t0 + std::chrono::milliseconds(PIECE_TIMEOUT_MS);
         while (std::chrono::steady_clock::now() < deadline) {
             auto status = future.wait_for(std::chrono::milliseconds(50));
             if (status == std::future_status::ready) {
                 try { return future.get(); } catch (...) { return {}; }
             }
         }
+        auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        VOZDUXAN_LOG("wait_for_piece(%d) read_piece TIMEOUT after %lldms — disk I/O thread busy?",
+                 piece_idx, (long long)waited_ms);
         std::lock_guard<std::mutex> lock(stream.waiters_mutex);
         stream.waiters.erase(piece_idx);
         return {};
@@ -710,6 +727,7 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(PIECE_TIMEOUT_MS);
 
+    int resume_tick = 0;
     while (std::chrono::steady_clock::now() < deadline) {
         /* abort if a newer seek arrived */
         if (stream.seek_generation.load(std::memory_order_acquire) != seek_gen) {
@@ -721,6 +739,21 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
         auto status = future.wait_for(std::chrono::milliseconds(100));
         if (status == std::future_status::ready) {
             try { return future.get(); } catch (...) { return {}; }
+        }
+
+        /* Every ~1 s (10 × 100 ms), re-assert the piece deadline and resume
+         * the torrent if it is still (or again) paused.  resume() is async,
+         * so a single call at the top of wait_for_piece() may not be enough —
+         * libtorrent might re-pause between ticks. */
+        if (++resume_tick % 10 == 0) {
+            if (stream.handle.flags() & lt::torrent_flags::paused) {
+                VOZDUXAN_LOG("wait_for_piece(%d): torrent still paused after %ds — re-calling resume()",
+                         piece_idx, resume_tick / 10);
+                stream.handle.resume();
+                stream.handle.set_piece_deadline(
+                    lt::piece_index_t(piece_idx), 0,
+                    lt::torrent_handle::alert_when_available);
+            }
         }
     }
 
@@ -836,6 +869,7 @@ VozduxanStreamInfo VozduxanSessionImpl::prepare(const char*    magnet,
                                          const uint8_t* torrent_data,
                                          size_t         torrent_len,
                                          int            file_idx,
+                                         int            is_main,
                                          VozduxanProgressFn progress_fn,
                                          void*          userdata) {
     VozduxanStreamInfo info{};
@@ -851,6 +885,23 @@ VozduxanStreamInfo VozduxanSessionImpl::prepare(const char*    magnet,
         lt::add_torrent_params atp = make_atp(magnet, torrent_data, torrent_len);
         VOZDUXAN_LOG("prepare() atp built");
 
+        /* Grab a generation stamp.
+         *
+         * Only MAIN prepares (is_main != 0) increment prepare_gen_.  This
+         * means a new main-track request cancels any in-flight fast-start —
+         * whether it belongs to an old main prepare or a background prefetch.
+         *
+         * Hover-prefetch (is_main == 0) does NOT increment the counter: it
+         * must never cancel the active playback stream's loading sequence.
+         *
+         * All callers read prepare_gen_ in their fast-start loop and abort
+         * when they detect a newer main prepare has arrived.
+         */
+        if (is_main) {
+            prepare_gen_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        uint64_t my_gen = prepare_gen_.load(std::memory_order_acquire);
+
         std::string token = generate_token();
         auto st = std::make_shared<StreamState>();
         st->file_idx = file_idx;
@@ -864,6 +915,28 @@ VozduxanStreamInfo VozduxanSessionImpl::prepare(const char*    magnet,
                  handle.is_valid() ? "yes" : "no",
                  (handle.flags() & lt::torrent_flags::paused) ? "YES (WARNING)" : "no");
         handle.force_reannounce(0); /* announce immediately; don't wait for tracker interval */
+
+        /* If this is a main prepare, stop the priority workers of any SIBLING
+           streams that share the same torrent handle (i.e. other tracks from the
+           same album torrent that are still in-flight or haven't been released yet).
+           Those workers keep calling set_piece_deadline() for the OLD file's pieces,
+           which competes directly with our new first piece and can starve it for the
+           entire fast-start window (8 s) plus wait_for_piece timeout (20 s).
+           We only set stop_flag here; the actual thread join happens later in
+           release_stream() when the caller drops the old token. */
+        if (is_main) {
+            std::lock_guard<std::mutex> slock(streams_mutex_);
+            for (auto& [tok, other] : streams_) {
+                if (other->handle == handle) {
+                    bool was_stopped = other->stop_flag.exchange(true);
+                    if (!was_stopped) {
+                        VOZDUXAN_LOG("prepare(%s) stopping sibling priority worker on token=%s "
+                                     "(same torrent, old file — clearing competing deadlines)",
+                                     token.c_str(), tok.c_str());
+                    }
+                }
+            }
+        }
 
         /* Check for immediately-available metadata (torrent data provided,
            not a magnet-only add).  libtorrent does NOT fire
@@ -888,13 +961,46 @@ VozduxanStreamInfo VozduxanSessionImpl::prepare(const char*    magnet,
             VOZDUXAN_LOG("prepare(%s) waiting for metadata (magnet path, timeout=%ds)...",
                      token.c_str(), METADATA_TIMEOUT_S);
             report(0.08f, "Resolving metadata...");
-            std::unique_lock<std::mutex> lk(st->metadata_mtx);
-            bool signalled = st->metadata_cv.wait_for(
-                lk,
-                std::chrono::seconds(METADATA_TIMEOUT_S),
-                [&]{ return st->metadata_ready.load() || st->metadata_failed.load(); }
-            );
-            (void)signalled;
+
+            /* Poll in 200 ms slices so we can detect prepare_gen_ changes and
+               abort when a newer track is requested. */
+            auto meta_deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(METADATA_TIMEOUT_S);
+            while (std::chrono::steady_clock::now() < meta_deadline) {
+                {
+                    std::unique_lock<std::mutex> lk(st->metadata_mtx);
+                    st->metadata_cv.wait_for(lk, std::chrono::milliseconds(200),
+                        [&]{ return st->metadata_ready.load() || st->metadata_failed.load(); });
+                }
+                if (st->metadata_ready.load() || st->metadata_failed.load()) break;
+
+                if (prepare_gen_.load(std::memory_order_acquire) != my_gen) {
+                    VOZDUXAN_LOG("prepare(%s) CANCELLED during metadata wait — newer prepare started",
+                             token.c_str());
+                    st->stop_flag.store(true);
+                    st->abort_http.store(true);
+                    bool has_sibling = false;
+                    {
+                        std::lock_guard<std::mutex> lock(streams_mutex_);
+                        streams_.erase(token);
+                        for (auto& [tok, other] : streams_) {
+                            if (other->handle == handle) { has_sibling = true; break; }
+                        }
+                    }
+                    if (!has_sibling) {
+                        handle.pause();
+                        std::lock_guard<std::mutex> ilock(idle_mutex_);
+                        idle_torrents_.push_back({handle, std::chrono::steady_clock::now()});
+                    } else {
+                        VOZDUXAN_LOG("prepare(%s) cancel: torrent NOT paused — sibling stream active",
+                                 token.c_str());
+                    }
+                    info.error = VOZDUXAN_ERR_INTERNAL;
+                    snprintf(info.error_msg, sizeof(info.error_msg),
+                             "Cancelled: superseded by newer prepare");
+                    return info;
+                }
+            }
 
             /* Last-chance fallback in case alert fired before stream was registered */
             if (!st->metadata_ready.load()) {
@@ -971,49 +1077,183 @@ VozduxanStreamInfo VozduxanSessionImpl::prepare(const char*    magnet,
                  st->first_piece, st->last_piece, piece_len);
 
         /* ── Pin file priorities ──────────────────────────────────────── */
-        std::vector<lt::download_priority_t> file_prios(
-            (size_t)num_files, lt::dont_download);
-        file_prios[(size_t)file_idx] = lt::top_priority;
-        handle.prioritize_files(file_prios);
+        if (is_main) {
+            /* Main prepare: concentrate bandwidth on the target file.
+             *
+             * Adjacent files (±1) are kept at low_priority instead of
+             * dont_download.  This preserves the "interested" signal to peers
+             * that happen to share pieces with the boundary region.  Without
+             * this, a peer that only holds pieces 0..N-1 (the just-played
+             * track's range) receives "not interested" the moment we switch
+             * tracks, causing it to choke us.  The subsequent unchoke round
+             * runs on a ~10 s timer, producing the observed 10–20 s stall
+             * while we wait for new peers that have the first piece of the
+             * next track.  Keeping adjacent files at low_priority means those
+             * peers stay unchoked; if they also have the new first piece they
+             * will serve it at top priority immediately. */
+            std::vector<lt::download_priority_t> file_prios(
+                (size_t)num_files, lt::dont_download);
+            file_prios[(size_t)file_idx] = lt::top_priority;
+            if (file_idx > 0)
+                file_prios[(size_t)(file_idx - 1)] = lt::low_priority;
+            if (file_idx + 1 < num_files)
+                file_prios[(size_t)(file_idx + 1)] = lt::low_priority;
+            handle.prioritize_files(file_prios);
+        } else {
+            /* Hover / prefetch: boost only the target file's pieces with
+               per-piece calls — never touch the rest of the torrent.
+               prioritize_files() resets every piece globally and would set
+               any concurrent main prepare's pieces to dont_download, signalling
+               "not interested" to peers and cancelling their in-flight requests
+               (observed as 8–20 s stalls when a hover fires mid fast-start). */
+            for (int i = st->first_piece; i <= st->last_piece; ++i) {
+                handle.piece_priority(lt::piece_index_t(i), lt::top_priority);
+            }
+        }
 
-        /* If the torrent was paused (e.g. released previously), resume it. */
+        /* Ensure the torrent is running. Normally it stays active between
+         * prepares (peer connections are preserved in release_stream), so
+         * this is typically a no-op. */
         if (handle.flags() & lt::torrent_flags::paused) {
-            VOZDUXAN_LOG("prepare(%s) torrent was paused — resuming", token.c_str());
+            VOZDUXAN_LOG("prepare(%s) torrent was paused — resuming (unexpected in normal flow)", token.c_str());
         }
         handle.resume();
 
-        /* ── Fast-start: prime deadline on first HIGH_PRIORITY_PIECES ─── */
+        /* ── Fast-start ───────────────────────────────────────────────────
+         *
+         * Main prepare (is_main=1):
+         *   Prime first HIGH_PRIORITY_PIECES with set_piece_deadline and wait
+         *   up to FAST_START_TIMEOUT_MS for piece 0 — full aggressive prebuffer.
+         *   Aborts early if prepare_gen_ changes (newer track requested).
+         *
+         * Hover / prefetch (is_main=0):
+         *   Prime only the very first piece and wait at most
+         *   HOVER_FAST_START_TIMEOUT_MS (500 ms).  Priming 20 pieces and
+         *   waiting 8 s would compete with the active playback download and
+         *   starve the main prepare that is likely running concurrently.
+         * ─────────────────────────────────────────────────────────────── */
         report(0.60f, "Buffering...");
-        int primed = 0;
-        for (int i = st->first_piece;
-             i < std::min(st->first_piece + HIGH_PRIORITY_PIECES, st->last_piece + 1);
-             ++i) {
-            handle.set_piece_deadline(lt::piece_index_t(i), 0);
-            ++primed;
-        }
-        VOZDUXAN_LOG("prepare(%s) fast-start: primed %d pieces, waiting for piece %d...",
-                 token.c_str(), primed, st->first_piece);
 
-        /* Wait until the very first piece is ready (up to FAST_START_TIMEOUT_MS). */
-        auto fast_start_begin = std::chrono::steady_clock::now();
-        auto fast_start_dl    = fast_start_begin +
-                                std::chrono::milliseconds(FAST_START_TIMEOUT_MS);
-        while (std::chrono::steady_clock::now() < fast_start_dl) {
-            if (handle.have_piece(lt::piece_index_t(st->first_piece))) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            float elapsed_ms = std::chrono::duration<float, std::milli>(
-                std::chrono::steady_clock::now() - fast_start_dl +
-                std::chrono::milliseconds(FAST_START_TIMEOUT_MS)).count();
-            report(0.60f + (elapsed_ms / FAST_START_TIMEOUT_MS) * 0.35f,
-                   "Buffering...");
-        }
+        /* Clear any stale piece deadlines before setting fresh ones.
+           Sibling priority workers (stopped above) may have left deadlines for
+           the old file's pieces on this handle.  Without clearing them, those
+           lingering deadlines compete with our new first piece even after the
+           workers exit, because libtorrent honours deadlines until explicitly
+           cleared or the piece is downloaded. */
+        handle.clear_piece_deadlines();
 
-        bool piece0_ready = handle.have_piece(lt::piece_index_t(st->first_piece));
-        auto elapsed_fast = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - fast_start_begin).count();
-        VOZDUXAN_LOG("prepare(%s) fast-start done in %lldms — piece %d ready=%s",
-                 token.c_str(), (long long)elapsed_fast,
-                 st->first_piece, piece0_ready ? "YES" : "NO (continuing anyway)");
+        if (is_main) {
+            /* Full aggressive prebuffer for the track the user just picked. */
+            int primed = 0;
+            for (int i = st->first_piece;
+                 i < std::min(st->first_piece + HIGH_PRIORITY_PIECES, st->last_piece + 1);
+                 ++i) {
+                /* Boundary pieces (first_piece, last_piece) may be shared with
+                 * adjacent files.  prioritize_files() processes files sequentially;
+                 * if the adjacent file's dont_download priority is applied after
+                 * this file's top_priority, the shared piece ends up as
+                 * dont_download.  set_piece_deadline() is a no-op on dont_download
+                 * pieces, so we explicitly pin each piece to top_priority first. */
+                handle.piece_priority(lt::piece_index_t(i), lt::top_priority);
+                handle.set_piece_deadline(lt::piece_index_t(i), 0);
+                ++primed;
+            }
+            VOZDUXAN_LOG("prepare(%s) fast-start: primed %d pieces, waiting for piece %d...",
+                     token.c_str(), primed, st->first_piece);
+
+            auto fast_start_begin = std::chrono::steady_clock::now();
+            auto fast_start_dl    = fast_start_begin +
+                                    std::chrono::milliseconds(FAST_START_TIMEOUT_MS);
+            while (std::chrono::steady_clock::now() < fast_start_dl) {
+                /* Abort if a newer main prepare() arrived. */
+                if (prepare_gen_.load(std::memory_order_acquire) != my_gen) {
+                    VOZDUXAN_LOG("prepare(%s) CANCELLED during fast-start — newer prepare started",
+                             token.c_str());
+                    st->stop_flag.store(true);
+                    st->abort_http.store(true);
+                    bool has_sibling = false;
+                    {
+                        std::lock_guard<std::mutex> lock(streams_mutex_);
+                        streams_.erase(token);
+                        for (auto& [tok, other] : streams_) {
+                            if (other->handle == handle) { has_sibling = true; break; }
+                        }
+                    }
+                    if (!has_sibling) {
+                        handle.pause();
+                        std::lock_guard<std::mutex> ilock(idle_mutex_);
+                        idle_torrents_.push_back({handle, std::chrono::steady_clock::now()});
+                    } else {
+                        VOZDUXAN_LOG("prepare(%s) cancel: torrent NOT paused — sibling stream active",
+                                 token.c_str());
+                    }
+                    info.error = VOZDUXAN_ERR_INTERNAL;
+                    snprintf(info.error_msg, sizeof(info.error_msg),
+                             "Cancelled: superseded by newer prepare");
+                    return info;
+                }
+
+                if (handle.have_piece(lt::piece_index_t(st->first_piece))) break;
+
+                /* Re-assert top priority and deadline on the first piece every
+                 * poll tick.  prioritize_files() is dispatched to libtorrent's
+                 * internal thread and may be processed after our initial
+                 * piece_priority() + set_piece_deadline() calls.  In that case
+                 * a boundary piece shared with an adjacent dont_download file
+                 * could end up as dont_download, and set_piece_deadline is a
+                 * no-op on dont_download pieces.  Repeating the assertion every
+                 * 50 ms guarantees the request reaches libtorrent's piece-picker
+                 * regardless of scheduling races or sequential_download-mode
+                 * pointer state. */
+                handle.piece_priority(lt::piece_index_t(st->first_piece),
+                                      lt::top_priority);
+                handle.set_piece_deadline(lt::piece_index_t(st->first_piece), 0);
+
+                /* If the torrent was paused by libtorrent's internal logic after
+                 * our prioritize_files() call (e.g. a "finished" state transition
+                 * or an async auto-management race), re-assert resume() so that
+                 * downloads can proceed.  The paused flag is re-checked every tick
+                 * because resume() is asynchronous — one call may not be enough. */
+                if (handle.flags() & lt::torrent_flags::paused) {
+                    VOZDUXAN_LOG("prepare(%s) fast-start: torrent paused — re-calling resume()",
+                             token.c_str());
+                    handle.resume();
+                }
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                float elapsed_ms = std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - fast_start_dl +
+                    std::chrono::milliseconds(FAST_START_TIMEOUT_MS)).count();
+                report(0.60f + (elapsed_ms / FAST_START_TIMEOUT_MS) * 0.35f,
+                       "Buffering...");
+            }
+
+            bool piece0_ready = handle.have_piece(lt::piece_index_t(st->first_piece));
+            auto elapsed_fast = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - fast_start_begin).count();
+            VOZDUXAN_LOG("prepare(%s) fast-start done in %lldms — piece %d ready=%s",
+                     token.c_str(), (long long)elapsed_fast,
+                     st->first_piece, piece0_ready ? "YES" : "NO (continuing anyway)");
+
+        } else {
+            /* Hover / prefetch: prime only piece 0 and wait at most 500 ms.
+               Keeps libtorrent bandwidth available for the active main track. */
+            handle.set_piece_deadline(lt::piece_index_t(st->first_piece), 0);
+            VOZDUXAN_LOG("prepare(%s) hover fast-start: primed piece %d, waiting up to %dms...",
+                     token.c_str(), st->first_piece, HOVER_FAST_START_TIMEOUT_MS);
+
+            auto hover_dl = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(HOVER_FAST_START_TIMEOUT_MS);
+            while (std::chrono::steady_clock::now() < hover_dl) {
+                if (handle.have_piece(lt::piece_index_t(st->first_piece))) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            bool piece0_ready = handle.have_piece(lt::piece_index_t(st->first_piece));
+            VOZDUXAN_LOG("prepare(%s) hover fast-start done — piece %d ready=%s",
+                     token.c_str(), st->first_piece,
+                     piece0_ready ? "YES" : "NO (continuing anyway)");
+        }
 
         /* ── Start priority worker ────────────────────────────────────── */
         st->priority_thread = std::thread([this, st]() {
@@ -1159,6 +1399,7 @@ void VozduxanSessionImpl::release_stream(const std::string& token) {
     }
 
     st->stop_flag.store(true);
+    st->abort_http.store(true);
     /* bump generation so any blocking serve_range/wait_for_piece exits */
     st->seek_generation.fetch_add(1, std::memory_order_release);
 
@@ -1171,12 +1412,13 @@ void VozduxanSessionImpl::release_stream(const std::string& token) {
     VOZDUXAN_LOG("release_stream(%s) priority_thread joined in %lldms", token.c_str(), (long long)join_ms);
 
     if (st->handle.is_valid()) {
-        /* Only pause the torrent if no other active stream is still using the
+        /* Only idle the torrent if no other active stream is still using the
          * same underlying torrent handle.  Two streams share a handle when the
          * second prepare() call gets an AlreadyManaged response from libtorrent
-         * (same info hash, e.g. version-mismatch superseded stream released
-         * while a newer prepare for the same track is still in flight).
-         * Pausing unconditionally kills the torrent for the sibling stream. */
+         * (same info hash, e.g. version-mismatch superseded stream, warm prefetch,
+         * or hover-prefetch released while the current stream is still in flight).
+         * Setting all priorities to dont_download on a shared handle would
+         * kill the sibling stream's downloads. */
         bool shared = false;
         {
             std::lock_guard<std::mutex> slock(streams_mutex_);
@@ -1190,11 +1432,30 @@ void VozduxanSessionImpl::release_stream(const std::string& token) {
         if (shared) {
             VOZDUXAN_LOG("release_stream(%s) torrent NOT paused — still used by another active stream", token.c_str());
         } else {
-            st->handle.pause();
+            /* Keep the torrent running with its current file priorities.
+             *
+             * Do NOT call prioritize_files(all: dont_download) here.
+             * Setting every file to dont_download signals "not interested"
+             * to all peers.  Peers respond by choking us, and the unchoke
+             * round runs on a ~10 s timer — so the very next prepare() that
+             * re-signals "interested" still waits up to 10 s before peers
+             * restart sending pieces (observed as 8–20 s fast-start stalls).
+             *
+             * Leaving the existing file priorities intact (typically the last
+             * played file at top_priority, others at dont_download) keeps us
+             * "interested" in the swarm.  Peers stay unchoked.  The next
+             * prepare() calls prioritize_files() for the new file, and pieces
+             * arrive immediately from already-unchoked peers.
+             *
+             * Side-effect: the idle torrent briefly continues downloading the
+             * last file's pieces.  The gap between release and the next
+             * prepare() is typically < 200 ms, so the extra data is negligible.
+             * TTL-based evict() handles long-term idle cleanup. */
+            st->handle.clear_piece_deadlines();
             std::lock_guard<std::mutex> lock(idle_mutex_);
             idle_torrents_.push_back({st->handle,
                                       std::chrono::steady_clock::now()});
-            VOZDUXAN_LOG("release_stream(%s) torrent paused and moved to idle cache", token.c_str());
+            VOZDUXAN_LOG("release_stream(%s) torrent idle — priorities unchanged, peers stay unchoked", token.c_str());
         }
     }
     VOZDUXAN_LOG("release_stream(%s) done", token.c_str());

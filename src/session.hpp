@@ -35,7 +35,9 @@ constexpr int PRIORITY_TICK_MS      = 100;   /* priority worker interval   */
 constexpr int PIECE_TIMEOUT_MS      = 20'000;/* max wait for one piece     */
 constexpr int METADATA_TIMEOUT_S    = 90;    /* magnet metadata resolution (slow DHT / trackers) */
 constexpr int HTTP_RECV_TIMEOUT_MS  = 5'000; /* idle HTTP socket           */
-constexpr int FAST_START_TIMEOUT_MS = 8'000; /* max wait for first piece   */
+constexpr int FAST_START_TIMEOUT_MS       = 8'000; /* max wait for first piece (main prepare)  */
+constexpr int HOVER_FAST_START_TIMEOUT_MS = 500;   /* max wait for hover/prefetch — must not   *
+                                                     * compete with active playback download     */
 
 /* ── Per-piece waiting ─────────────────────────────────────────────────── */
 struct PieceWaiters {
@@ -57,6 +59,12 @@ struct StreamState {
 
     std::atomic<int64_t>  playback_byte{0};
     std::atomic<bool>     stop_flag{false};
+    /* abort_http: set when the stream is fully released or the session is
+     * destroyed. serve_range() aborts on this flag.  NOT set when only the
+     * priority worker is stopped for sibling conflict resolution, so that a
+     * pre-warmed prefetch stream can still be served after its priority worker
+     * is silenced by a competing same-torrent prepare(). */
+    std::atomic<bool>     abort_http{false};
 
     /* metadata signalling */
     std::atomic<bool>     metadata_ready{false};
@@ -91,6 +99,7 @@ public:
                            const uint8_t* torrent_data,
                            size_t         torrent_len,
                            int            file_idx,
+                           int            is_main,
                            VozduxanProgressFn progress_fn,
                            void*          userdata);
 
@@ -161,6 +170,11 @@ private:
     std::vector<IdleTorrent> idle_torrents_;
 
     std::atomic<uint32_t> token_counter_{0};
+    /* Incremented at the start of every prepare() call.  The fast-start and
+       metadata-wait loops compare against this value and abort early when a
+       newer prepare() arrives, preventing a storm of concurrent 8-second
+       blocking calls from exhausting libtorrent's connection pool.         */
+    std::atomic<uint64_t> prepare_gen_{0};
 
     VozduxanLogFn   log_fn_{nullptr};
     void*       log_userdata_{nullptr};

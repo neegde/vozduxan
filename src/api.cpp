@@ -41,6 +41,7 @@ VozduxanStreamInfo vozduxan_stream_prepare(VozduxanSession*   session,
                                     const uint8_t* torrent_data,
                                     size_t         torrent_len,
                                     int            file_idx,
+                                    int            is_main,
                                     VozduxanProgressFn progress_fn,
                                     void*          userdata) {
     VozduxanStreamInfo info{};
@@ -51,7 +52,7 @@ VozduxanStreamInfo vozduxan_stream_prepare(VozduxanSession*   session,
     }
     try {
         return session->prepare(magnet, torrent_data, torrent_len,
-                                file_idx, progress_fn, userdata);
+                                file_idx, is_main, progress_fn, userdata);
     } catch (const std::exception& e) {
         info.error = VOZDUXAN_ERR_INTERNAL;
         snprintf(info.error_msg, sizeof(info.error_msg), "%s", e.what());

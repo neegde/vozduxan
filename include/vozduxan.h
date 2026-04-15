@@ -93,6 +93,10 @@ void         vozduxan_session_destroy(VozduxanSession* session);
  * @param torrent_data Raw .torrent bytes (may be NULL if magnet given)
  * @param torrent_len  Length of torrent_data
  * @param file_idx     Which file inside the torrent to stream
+ * @param is_main      Non-zero for the active playback track; zero for
+ *                     prefetch / hover-prefetch.  Main prepares cancel any
+ *                     in-flight fast-start (own or background), preventing
+ *                     concurrent blocking calls from stalling the engine.
  * @param progress_fn  Called periodically during metadata resolution
  * @param userdata     Passed verbatim to progress_fn
  */
@@ -102,6 +106,7 @@ VozduxanStreamInfo vozduxan_stream_prepare(
     const uint8_t* torrent_data,
     size_t         torrent_len,
     int            file_idx,
+    int            is_main,
     VozduxanProgressFn progress_fn,
     void*          userdata
 );
