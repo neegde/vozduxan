@@ -44,10 +44,14 @@ if(NOT LibtorrentRasterbar_FOUND)
         set(BUILD_SHARED_LIBS               OFF CACHE BOOL "" FORCE)
         set(deprecated-functions            OFF CACHE BOOL "" FORCE)
         set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+        # Static OpenSSL: avoids dylib path deps in the distributed binary.
+        set(OPENSSL_USE_STATIC_LIBS         ON  CACHE BOOL "" FORCE)
         FetchContent_MakeAvailable(libtorrent)
         # In-tree build exposes `torrent-rasterbar` only; the LibtorrentRasterbar::
         # namespaced target exists after install/export, not in FetchContent.
         set(LT_TARGET torrent-rasterbar)
+        # Install static libtorrent so build.rs can link it via static=torrent-rasterbar.
+        install(TARGETS torrent-rasterbar ARCHIVE DESTINATION lib)
     endif()
 else()
     set(LT_TARGET LibtorrentRasterbar::torrent-rasterbar)
