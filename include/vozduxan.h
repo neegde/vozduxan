@@ -73,6 +73,12 @@ typedef struct {
     char           error_msg[256];
 } VozduxanFileList;
 
+/* ── Stream stats ──────────────────────────────────────────────────────── */
+typedef struct {
+    int32_t download_rate_bytes; /* current download rate in bytes/sec       */
+    int32_t num_peers;           /* number of connected peers                */
+} VozduxanStreamStats;
+
 /* ── Progress callback ─────────────────────────────────────────────────── */
 typedef void (*VozduxanProgressFn)(float progress,       /* 0.0 – 1.0         */
                                const char* status,
@@ -110,6 +116,12 @@ VozduxanStreamInfo vozduxan_stream_prepare(
     VozduxanProgressFn progress_fn,
     void*          userdata
 );
+
+/**
+ * Return current download rate (bytes/sec) and peer count for a stream token.
+ * Returns zeroes if the token is unknown.  Fast — no blocking.
+ */
+VozduxanStreamStats vozduxan_stream_stats(VozduxanSession* session, const char* token);
 
 /**
  * Notify the engine of the current playback byte offset.

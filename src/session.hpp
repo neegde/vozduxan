@@ -32,10 +32,10 @@ namespace lt = libtorrent;
 constexpr int HIGH_PRIORITY_PIECES  = 20;    /* pieces with hard deadline  */
 constexpr int MID_PRIORITY_PIECES   = 60;    /* high-priority lookahead    */
 constexpr int PRIORITY_TICK_MS      = 100;   /* priority worker interval   */
-constexpr int PIECE_TIMEOUT_MS      = 20'000;/* max wait for one piece     */
+constexpr int PIECE_TIMEOUT_MS      = 60'000;/* max wait for one piece     */
 constexpr int METADATA_TIMEOUT_S    = 90;    /* magnet metadata resolution (slow DHT / trackers) */
 constexpr int HTTP_RECV_TIMEOUT_MS  = 5'000; /* idle HTTP socket           */
-constexpr int FAST_START_TIMEOUT_MS       = 8'000; /* max wait for first piece (main prepare)  */
+constexpr int FAST_START_TIMEOUT_MS       = 1'500; /* max wait for first piece (main prepare)  */
 constexpr int HOVER_FAST_START_TIMEOUT_MS = 500;   /* max wait for hover/prefetch — must not   *
                                                      * compete with active playback download     */
 
@@ -112,6 +112,10 @@ public:
     void     evict();
     uint16_t http_port() const { return http_port_; }
 
+    /* download_rate in bytes/sec and num connected peers for a stream token */
+    struct StreamStats { int32_t download_rate_bytes; int32_t num_peers; };
+    StreamStats stream_stats(const std::string& token);
+
 private:
     /* libtorrent session setup */
     void init_session();
@@ -144,6 +148,12 @@ private:
     std::string    generate_token();
     static std::string detect_mime(const std::string& filename);
 
+    /* Direct piece read — bypasses libtorrent's async disk I/O queue.
+     * Used by wait_for_piece() when have_piece() is true to avoid multi-second
+     * stalls caused by the write backlog from fast-start priming. */
+    std::vector<char> read_piece_direct(int piece_idx,
+                                        const lt::torrent_info& ti);
+
     /* structured logging: log_fn_ when set; else stderr */
     void log(const char* fmt, ...);
 
@@ -161,6 +171,10 @@ private:
 
     std::thread alert_thread_;
     std::thread http_thread_;
+    /* Per-connection threads (one per accepted socket).  Tracked so the
+       destructor can join them instead of letting them access freed memory. */
+    std::mutex               conn_threads_mutex_;
+    std::vector<std::thread> conn_threads_;
 
     std::mutex streams_mutex_;
     std::unordered_map<std::string, std::shared_ptr<StreamState>> streams_;

@@ -168,22 +168,24 @@ struct ParsedRequest {
 static ParsedRequest read_http_request(sock_t sock) {
     std::string raw;
     raw.reserve(512);
-    char ch;
+    char buf[512];
     struct pollfd pfd;
     pfd.fd      = sock;
     pfd.events  = POLLIN;
     pfd.revents = 0;
 
+    /* Read up to 512 bytes per syscall instead of one character at a time.
+       A typical HTTP Range request is ~200 bytes — this reduces syscall
+       overhead from ~200 to 1 per request, significantly lowering first-byte
+       latency of the audio stream response. */
     while (raw.size() < 8192) {
+        pfd.revents = 0;
         int ready = vozduxan_poll(&pfd, 1, HTTP_RECV_TIMEOUT_MS);
         if (ready <= 0) return {};
-        ssize_t n = recv(sock, &ch, 1, 0);
+        ssize_t n = recv(sock, buf, sizeof(buf), 0);
         if (n <= 0) return {};
-        raw += ch;
-        size_t len = raw.size();
-        if (len >= 4 &&
-            raw[len-4]=='\r' && raw[len-3]=='\n' &&
-            raw[len-2]=='\r' && raw[len-1]=='\n') break;
+        raw.append(buf, (size_t)n);
+        if (raw.find("\r\n\r\n") != std::string::npos) break;
     }
 
     ParsedRequest req;
@@ -276,23 +278,51 @@ VozduxanSessionImpl::VozduxanSessionImpl(const VozduxanConfig& cfg)
 
 VozduxanSessionImpl::~VozduxanSessionImpl() {
     save_dht_state();
+
+    /* 1. Signal every loop to exit and every serve_range to abort.
+          Do this BEFORE joining any threads so they see the flags on their
+          next iteration and don't block for a full timeout interval. */
     running_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+        for (auto& [token, st] : streams_) {
+            st->stop_flag.store(true);
+            st->abort_http.store(true);
+            st->seek_generation.fetch_add(1, std::memory_order_release);
+        }
+    }
+
     session_.abort();
 
+    /* 2. Close the server socket — unblocks the accept() poll in http_server_loop. */
     if (server_fd_ != kInvalidSock) {
         shutdown_sock(server_fd_);
         close_sock(server_fd_);
         server_fd_ = kInvalidSock;
     }
 
+    /* 3. Join background threads in order:
+          alert_loop exits when running_=false (polls every 200 ms).
+          http_server_loop exits when running_=false (polls every 500 ms). */
     if (alert_thread_.joinable()) alert_thread_.join();
     if (http_thread_.joinable())  http_thread_.join();
 
+    /* 4. Join per-connection threads.
+          They check running_ in their keep-alive loop and abort_http in
+          serve_range, so they exit within HTTP_RECV_TIMEOUT_MS (5 s) at most.
+          Previously these were detached, which caused use-after-free when the
+          destructor returned while threads still held a `this` pointer. */
+    {
+        std::lock_guard<std::mutex> lock(conn_threads_mutex_);
+        for (auto& t : conn_threads_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+    /* 5. Join priority workers (serve_range has already stopped, safe to join). */
     {
         std::lock_guard<std::mutex> lock(streams_mutex_);
         for (auto& [token, st] : streams_) {
-            st->stop_flag.store(true);
-            st->abort_http.store(true);
             if (st->priority_thread.joinable()) st->priority_thread.join();
         }
     }
@@ -344,6 +374,7 @@ void VozduxanSessionImpl::init_session() {
     sp.set_int(lt::settings_pack::alert_mask,
                lt::alert_category::status |
                lt::alert_category::piece_progress |
+               lt::alert_category::storage |  /* read_piece_alert lives here */
                lt::alert_category::error);
 
     if (cfg_.listen_port > 0) {
@@ -422,6 +453,23 @@ void VozduxanSessionImpl::on_read_piece(lt::read_piece_alert* rpa) {
     if (rpa->error) {
         VOZDUXAN_LOG("read_piece ERROR piece=%d: %s",
                  (int)rpa->piece, rpa->error.message().c_str());
+        /* Fulfill any waiters with empty data so serve_range fails fast rather
+         * than blocking until PIECE_TIMEOUT_MS.  Previously this returned early
+         * without fulfilling the promise, leaving wait_for_piece blocked for up
+         * to 20 s while the browser timed out the HTTP connection at ~9 s. */
+        std::lock_guard<std::mutex> slock(streams_mutex_);
+        for (auto& [token, st] : streams_) {
+            if (st->handle != rpa->handle) continue;
+            std::lock_guard<std::mutex> wlock(st->waiters_mutex);
+            auto it = st->waiters.find((int)rpa->piece);
+            if (it == st->waiters.end()) break;
+            for (auto& promise : it->second.promises) {
+                try { promise.set_value({}); }
+                catch (const std::future_error&) {}
+            }
+            st->waiters.erase(it);
+            break;
+        }
         return;
     }
 
@@ -518,10 +566,15 @@ void VozduxanSessionImpl::http_server_loop() {
         sock_t client = accept(server_fd_, nullptr, nullptr);
         if (client == kInvalidSock) continue;
 
-        std::thread([this, client]() {
-            handle_http_connection(client);
-            close_sock(client);
-        }).detach();
+        {
+            std::lock_guard<std::mutex> lock(conn_threads_mutex_);
+            /* Track connection threads so the destructor can join them
+               instead of letting detached threads access freed memory. */
+            conn_threads_.emplace_back([this, client]() {
+                handle_http_connection(client);
+                close_sock(client);
+            });
+        }
     }
 }
 
@@ -656,6 +709,53 @@ bool VozduxanSessionImpl::serve_range(sock_t sock, StreamState& stream,
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+ *  Direct piece read (synchronous file I/O)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+std::vector<char> VozduxanSessionImpl::read_piece_direct(
+        int piece_idx, const lt::torrent_info& ti) {
+
+    auto&   files      = ti.files();
+    int     piece_len  = ti.piece_length();
+    int     num_pieces = ti.num_pieces();
+
+    int64_t logical_start = (int64_t)piece_idx * piece_len;
+    /* piece_size(idx) handles the short last piece automatically. */
+    int64_t piece_size    = (piece_idx == num_pieces - 1)
+                            ? ti.total_size() - logical_start
+                            : piece_len;
+
+    std::vector<char> data((size_t)piece_size, '\0');
+
+    /* map_block(piece, 0, piece_size) returns one file_slice per spanning file. */
+    auto slices = files.map_block(lt::piece_index_t(piece_idx), 0, (int)piece_size);
+    int64_t buf_off = 0;
+
+    for (auto const& sl : slices) {
+        if (sl.size == 0) { buf_off += sl.size; continue; } /* padding */
+
+        std::string fpath = files.file_path(sl.file_index, storage_path_);
+        std::ifstream f(fpath, std::ios::binary);
+        if (!f) {
+            VOZDUXAN_LOG("read_piece_direct(%d): cannot open %s",
+                     piece_idx, fpath.c_str());
+            return {};
+        }
+        f.seekg((std::streamoff)sl.offset);
+        f.read(data.data() + buf_off, (std::streamsize)sl.size);
+        if (f.gcount() != (std::streamsize)sl.size) {
+            VOZDUXAN_LOG("read_piece_direct(%d): short read in %s (got %lld / %lld)",
+                     piece_idx, fpath.c_str(),
+                     (long long)f.gcount(), (long long)sl.size);
+            return {};
+        }
+        buf_off += sl.size;
+    }
+
+    return data;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
  *  Piece read synchronisation
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -672,16 +772,34 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
         stream.handle.resume();
     }
 
-    /* If we already have this piece, read it directly.
+    /* If we already have this piece, read it directly from disk.
      *
-     * Use a generous timeout (PIECE_TIMEOUT_MS) rather than a short one.
-     * The disk I/O thread may be busy writing newly-downloaded pieces that
-     * arrived in response to the urgent set_piece_deadline(0) calls made in
-     * prepare() — 20-100+ write jobs ahead of this read job is realistic when
-     * the first piece of a new track is shared (and already on disk) while
-     * pieces 1-N are arriving rapidly.  A 2-second cap was too tight and
-     * caused silent serve_range failures → MEDIA_ERR_SRC_NOT_SUPPORTED. */
+     * Problem with the async read_piece() path:
+     *   libtorrent dispatches read_piece() to the same disk I/O thread that handles
+     *   writes.  When fast-start primes ~20 pieces with set_piece_deadline(0) and
+     *   those pieces happen to arrive simultaneously (e.g. the target track starts on
+     *   a piece that is the last piece of the previous track — already on disk — while
+     *   pieces 1-N of the new track are arriving rapidly from peers), the disk I/O
+     *   thread accumulates 10-20 pending writes ahead of our single read.  On macOS
+     *   this stalls the first HTTP response body byte for 9+ seconds, which is exactly
+     *   Safari / WebKit's media-source timeout → MEDIA_ERR_SRC_NOT_SUPPORTED.
+     *
+     *   Raising PIECE_TIMEOUT_MS from 2 s to 20 s only masked the symptom on the
+     *   vozduxan side; the browser still gives up at ~9 s.
+     *
+     * Fix: read the piece synchronously via std::ifstream using file_storage::map_block
+     *   to locate the data.  This completely bypasses the disk I/O thread and finishes
+     *   in < 5 ms on SSD.  Async read_piece() is kept as a fallback in case the direct
+     *   read fails (e.g. the torrent uses a non-default storage backend). */
     if (stream.handle.have_piece(lt::piece_index_t(piece_idx))) {
+        auto data = read_piece_direct(piece_idx, *stream.ti);
+        if (!data.empty()) return data;
+
+        VOZDUXAN_LOG("wait_for_piece(%d) direct read failed — falling back to async read_piece",
+                 piece_idx);
+
+        /* Async fallback: unchanged from original, but now also checks abort/seek
+         * so that releasing the stream unblocks the serving thread immediately. */
         std::future<std::vector<char>> future;
         {
             std::lock_guard<std::mutex> lock(stream.waiters_mutex);
@@ -694,6 +812,16 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
         auto t0       = std::chrono::steady_clock::now();
         auto deadline = t0 + std::chrono::milliseconds(PIECE_TIMEOUT_MS);
         while (std::chrono::steady_clock::now() < deadline) {
+            if (stream.abort_http.load()) {
+                std::lock_guard<std::mutex> lock(stream.waiters_mutex);
+                stream.waiters.erase(piece_idx);
+                return {};
+            }
+            if (stream.seek_generation.load(std::memory_order_acquire) != seek_gen) {
+                std::lock_guard<std::mutex> lock(stream.waiters_mutex);
+                stream.waiters.erase(piece_idx);
+                return {};
+            }
             auto status = future.wait_for(std::chrono::milliseconds(50));
             if (status == std::future_status::ready) {
                 try { return future.get(); } catch (...) { return {}; }
@@ -760,6 +888,22 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
     VOZDUXAN_LOG("wait_for_piece(%d) TIMEOUT after %dms — paused=%s",
              piece_idx, PIECE_TIMEOUT_MS,
              (stream.handle.flags() & lt::torrent_flags::paused) ? "YES" : "no");
+
+    /* Last-chance check: the piece may have arrived during the last 100 ms
+     * polling interval, just after the loop exited.  If have_piece() is true
+     * now, serve it via direct disk read rather than returning an empty vector
+     * and forcing the browser to fire MEDIA_ERR_SRC_NOT_SUPPORTED.          */
+    if (stream.handle.have_piece(lt::piece_index_t(piece_idx))) {
+        auto data = read_piece_direct(piece_idx, *stream.ti);
+        if (!data.empty()) {
+            VOZDUXAN_LOG("wait_for_piece(%d) last-chance direct read succeeded — piece arrived near timeout",
+                     piece_idx);
+            std::lock_guard<std::mutex> lock(stream.waiters_mutex);
+            stream.waiters.erase(piece_idx);
+            return data;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(stream.waiters_mutex);
     stream.waiters.erase(piece_idx);
     return {};
@@ -797,7 +941,13 @@ void VozduxanSessionImpl::run_priority_worker(std::shared_ptr<StreamState> strea
             }
         }
 
-        /* ── Set priority on all file pieces ────────────────────────── */
+        /* ── Set priority on all file pieces ────────────────────────────
+         * Only call piece_priority() when the tier assignment actually changes.
+         * Calling it for every piece every tick saturates libtorrent's internal
+         * message queue on large files (e.g. a 300 MB FLAC with 1200 pieces
+         * would queue 1200 messages per 100 ms tick even when nothing changed).
+         * ─────────────────────────────────────────────────────────────────── */
+        auto prios = stream->handle.get_piece_priorities();
         for (int i = stream->first_piece; i <= stream->last_piece; ++i) {
             lt::download_priority_t prio;
 
@@ -817,6 +967,8 @@ void VozduxanSessionImpl::run_priority_worker(std::shared_ptr<StreamState> strea
                 prio = lt::default_priority;
             }
 
+            /* Only send the message when the priority actually changes. */
+            if ((size_t)i < prios.size() && prios[(size_t)i] == prio) continue;
             stream->handle.piece_priority(lt::piece_index_t(i), prio);
         }
     }
@@ -1315,12 +1467,28 @@ VozduxanFileList VozduxanSessionImpl::list_files(const char*    magnet,
                 streams_[token] = st;
             }
 
-            std::unique_lock<std::mutex> lk(st->metadata_mtx);
-            st->metadata_cv.wait_for(
-                lk,
-                std::chrono::seconds(METADATA_TIMEOUT_S),
-                [&]{ return st->metadata_ready.load() || st->metadata_failed.load(); }
-            );
+            /* Poll in 200 ms slices so the destructor's running_=false is
+               detected quickly, avoiding a 90-second block during shutdown. */
+            auto meta_deadline = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(METADATA_TIMEOUT_S);
+            while (std::chrono::steady_clock::now() < meta_deadline) {
+                if (!running_.load()) {
+                    VOZDUXAN_LOG("list_files(%s) CANCELLED — session shutting down",
+                             token.c_str());
+                    std::lock_guard<std::mutex> lock(streams_mutex_);
+                    streams_.erase(token);
+                    result.error = VOZDUXAN_ERR_INTERNAL;
+                    snprintf(result.error_msg, sizeof(result.error_msg),
+                             "Cancelled: session shutting down");
+                    return result;
+                }
+                {
+                    std::unique_lock<std::mutex> lk(st->metadata_mtx);
+                    st->metadata_cv.wait_for(lk, std::chrono::milliseconds(200),
+                        [&]{ return st->metadata_ready.load() || st->metadata_failed.load(); });
+                }
+                if (st->metadata_ready.load() || st->metadata_failed.load()) break;
+            }
 
             if (!st->metadata_ready.load()) {
                 auto ti = handle.torrent_file();
@@ -1332,14 +1500,38 @@ VozduxanFileList VozduxanSessionImpl::list_files(const char*    magnet,
         }
 
         if (!st->metadata_ready.load()) {
-            session_.remove_torrent(handle);
+            {
+                bool in_use = false;
+                std::lock_guard<std::mutex> lock(streams_mutex_);
+                for (auto& [tok, active] : streams_) {
+                    if (active->handle == handle) { in_use = true; break; }
+                }
+                if (!in_use) session_.remove_torrent(handle);
+            }
             result.error = VOZDUXAN_ERR_METADATA_TIMEOUT;
             snprintf(result.error_msg, sizeof(result.error_msg), "Metadata timeout");
             return result;
         }
 
         if (!st->ti) st->ti = handle.torrent_file();
-        session_.remove_torrent(handle);
+
+        /* Only remove if no active stream is using this handle.
+         * If the same magnet is currently being streamed, libtorrent returned the
+         * existing handle (AlreadyManaged) and calling remove_torrent() here would
+         * kill the active download. */
+        {
+            bool in_use = false;
+            std::lock_guard<std::mutex> lock(streams_mutex_);
+            for (auto& [tok, active] : streams_) {
+                if (active->handle == handle) { in_use = true; break; }
+            }
+            if (!in_use) {
+                session_.remove_torrent(handle);
+                VOZDUXAN_LOG("list_files: torrent removed (was not in active streams)");
+            } else {
+                VOZDUXAN_LOG("list_files: torrent NOT removed — handle is used by an active stream");
+            }
+        }
 
         if (!st->ti) {
             result.error = VOZDUXAN_ERR_INTERNAL;
@@ -1382,6 +1574,20 @@ void VozduxanSessionImpl::notify_position(const std::string& token,
     auto it = streams_.find(token);
     if (it != streams_.end())
         it->second->playback_byte.store(byte_offset, std::memory_order_relaxed);
+}
+
+VozduxanSessionImpl::StreamStats
+VozduxanSessionImpl::stream_stats(const std::string& token) {
+    StreamStats result{0, 0};
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    auto it = streams_.find(token);
+    if (it == streams_.end()) return result;
+    try {
+        auto s = it->second->handle.status(lt::torrent_handle::query_accurate_download_counters);
+        result.download_rate_bytes = static_cast<int32_t>(s.download_rate);
+        result.num_peers           = s.num_peers;
+    } catch (...) {}
+    return result;
 }
 
 void VozduxanSessionImpl::release_stream(const std::string& token) {

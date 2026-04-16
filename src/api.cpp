@@ -60,6 +60,18 @@ VozduxanStreamInfo vozduxan_stream_prepare(VozduxanSession*   session,
     }
 }
 
+VozduxanStreamStats vozduxan_stream_stats(VozduxanSession* session,
+                                          const char*  token) {
+    VozduxanStreamStats result{0, 0};
+    if (!session || !token) return result;
+    try {
+        auto s = session->stream_stats(token);
+        result.download_rate_bytes = s.download_rate_bytes;
+        result.num_peers           = s.num_peers;
+    } catch (...) {}
+    return result;
+}
+
 void vozduxan_stream_notify_position(VozduxanSession* session,
                                   const char*  token,
                                   int64_t      byte_offset) {
