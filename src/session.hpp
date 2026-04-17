@@ -32,7 +32,7 @@ namespace lt = libtorrent;
 constexpr int HIGH_PRIORITY_PIECES  = 20;    /* pieces with hard deadline  */
 constexpr int MID_PRIORITY_PIECES   = 60;    /* high-priority lookahead    */
 constexpr int PRIORITY_TICK_MS      = 100;   /* priority worker interval   */
-constexpr int PIECE_TIMEOUT_MS      = 60'000;/* max wait for one piece     */
+constexpr int PIECE_TIMEOUT_MS      = 180'000;/* max wait for one piece     */
 constexpr int METADATA_TIMEOUT_S    = 90;    /* magnet metadata resolution (slow DHT / trackers) */
 constexpr int HTTP_RECV_TIMEOUT_MS  = 5'000; /* idle HTTP socket           */
 constexpr int FAST_START_TIMEOUT_MS       = 1'500; /* max wait for first piece (main prepare)  */
@@ -87,6 +87,20 @@ struct StreamState {
 struct IdleTorrent {
     lt::torrent_handle              handle;
     std::chrono::steady_clock::time_point since;
+};
+
+/* ── Per-connection HTTP thread entry ───────────────────────────────────── *
+ * Stores a "done" flag alongside the thread so http_server_loop can prune
+ * finished entries on each new accept(), keeping conn_threads_ bounded to
+ * the number of currently-active connections rather than growing without
+ * limit over the session lifetime.  (std::atomic is non-movable, so we
+ * heap-allocate via shared_ptr and store a raw pointer in the lambda.)    */
+struct ConnEntry {
+    std::atomic<bool> done{false};
+    std::thread       th;
+    ConnEntry() = default;
+    ConnEntry(const ConnEntry&) = delete;
+    ConnEntry& operator=(const ConnEntry&) = delete;
 };
 
 /* ── Main session class ────────────────────────────────────────────────── */
@@ -149,10 +163,10 @@ private:
     static std::string detect_mime(const std::string& filename);
 
     /* Direct piece read — bypasses libtorrent's async disk I/O queue.
-     * Used by wait_for_piece() when have_piece() is true to avoid multi-second
-     * stalls caused by the write backlog from fast-start priming. */
+     * Only reads slices belonging to stream.file_idx; adjacent dont_download
+     * files are skipped (their regions stay zero).  See session.cpp for rationale. */
     std::vector<char> read_piece_direct(int piece_idx,
-                                        const lt::torrent_info& ti);
+                                        const StreamState& stream);
 
     /* structured logging: log_fn_ when set; else stderr */
     void log(const char* fmt, ...);
@@ -171,10 +185,11 @@ private:
 
     std::thread alert_thread_;
     std::thread http_thread_;
-    /* Per-connection threads (one per accepted socket).  Tracked so the
-       destructor can join them instead of letting them access freed memory. */
-    std::mutex               conn_threads_mutex_;
-    std::vector<std::thread> conn_threads_;
+    /* Per-connection threads (one per accepted socket).  Tracked via
+       shared_ptr<ConnEntry> so http_server_loop can prune finished entries
+       on every accept() and the destructor only joins truly-active ones.  */
+    std::mutex                                conn_threads_mutex_;
+    std::vector<std::shared_ptr<ConnEntry>>   conn_threads_;
 
     std::mutex streams_mutex_;
     std::unordered_map<std::string, std::shared_ptr<StreamState>> streams_;
