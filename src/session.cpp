@@ -833,11 +833,14 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
      *   in < 5 ms on SSD.  Async read_piece() is kept as a fallback in case the direct
      *   read fails (e.g. the torrent uses a non-default storage backend). */
     if (stream.handle.have_piece(lt::piece_index_t(piece_idx))) {
-        auto data = read_piece_direct(piece_idx, stream);
-        if (!data.empty()) return data;
-
-        VOZDUXAN_LOG("wait_for_piece(%d) direct read failed — falling back to async read_piece",
-                 piece_idx);
+        if (stream.direct_read_ok.load(std::memory_order_relaxed)) {
+            auto data = read_piece_direct(piece_idx, stream);
+            if (!data.empty()) return data;
+            VOZDUXAN_LOG("wait_for_piece(%d) direct read failed — "
+                         "disabling for this stream, falling back to async read_piece",
+                         piece_idx);
+            stream.direct_read_ok.store(false, std::memory_order_relaxed);
+        }
 
         /* Async fallback: unchanged from original, but now also checks abort/seek
          * so that releasing the stream unblocks the serving thread immediately. */
@@ -925,15 +928,17 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
          * for the full PIECE_TIMEOUT_MS (60 s) even though the piece is
          * already on disk.  Detect arrival here directly so we never wait
          * longer than one 100 ms tick after the piece lands. */
-        if (stream.handle.have_piece(lt::piece_index_t(piece_idx))) {
+        if (stream.handle.have_piece(lt::piece_index_t(piece_idx)) &&
+                stream.direct_read_ok.load(std::memory_order_relaxed)) {
             auto data = read_piece_direct(piece_idx, stream);
             if (!data.empty()) {
                 std::lock_guard<std::mutex> lock(stream.waiters_mutex);
                 stream.waiters.erase(piece_idx);
                 return data;
             }
-            /* read_piece_direct failed despite have_piece — let the future
-             * path resolve it (async read_piece already queued above). */
+            /* read_piece_direct failed despite have_piece — disable for this
+             * stream; the future path (async read_piece) will resolve it. */
+            stream.direct_read_ok.store(false, std::memory_order_relaxed);
         }
 
         /* Every ~1 s (10 × 100 ms): re-assert deadline + alert_when_available
@@ -985,7 +990,8 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         if (stream.abort_http.load()) break;
         if (stream.seek_generation.load(std::memory_order_acquire) != seek_gen) break;
-        if (stream.handle.have_piece(lt::piece_index_t(piece_idx))) {
+        if (stream.handle.have_piece(lt::piece_index_t(piece_idx)) &&
+                stream.direct_read_ok.load(std::memory_order_relaxed)) {
             auto data = read_piece_direct(piece_idx, stream);
             if (!data.empty()) {
                 VOZDUXAN_LOG("wait_for_piece(%d) grace-period direct read succeeded after +%dms",
@@ -994,6 +1000,7 @@ std::vector<char> VozduxanSessionImpl::wait_for_piece(StreamState& stream,
                 stream.waiters.erase(piece_idx);
                 return data;
             }
+            stream.direct_read_ok.store(false, std::memory_order_relaxed);
         }
     }
 

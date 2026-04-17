@@ -75,6 +75,13 @@ struct StreamState {
     /* seek generation: increment to cancel in-flight serve_range calls */
     std::atomic<uint64_t> seek_generation{0};
 
+    /* Set to false after the first read_piece_direct failure so subsequent
+     * pieces skip the direct-read path entirely.  Avoids repeated log spam
+     * and failed open() calls when the target file has not been created on
+     * disk yet (e.g. hover-prefetch streams where prioritize_files() was
+     * never called — boundary pieces can be "have" while the file is absent). */
+    std::atomic<bool> direct_read_ok{true};
+
     /* priority worker */
     std::thread priority_thread;
 
