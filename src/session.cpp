@@ -507,10 +507,7 @@ void VozduxanSessionImpl::on_metadata_received(lt::metadata_received_alert* a) {
     int matched = 0;
     for (auto& [token, st] : streams_) {
         if (st->handle == a->handle) {
-            {
-                std::lock_guard<std::mutex> ml(st->metadata_mtx);
-                st->metadata_ready.store(true);
-            }
+            st->metadata_ready.store(true, std::memory_order_release);
             st->metadata_cv.notify_all();
             VOZDUXAN_LOG("metadata_received -> token=%s notified", token.c_str());
             ++matched;
@@ -526,10 +523,7 @@ void VozduxanSessionImpl::on_metadata_failed(lt::metadata_failed_alert* a) {
     std::lock_guard<std::mutex> lock(streams_mutex_);
     for (auto& [token, st] : streams_) {
         if (st->handle == a->handle) {
-            {
-                std::lock_guard<std::mutex> ml(st->metadata_mtx);
-                st->metadata_failed.store(true);
-            }
+            st->metadata_failed.store(true, std::memory_order_release);
             st->metadata_cv.notify_all();
             VOZDUXAN_LOG("metadata_failed -> token=%s notified", token.c_str());
         }
